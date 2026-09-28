@@ -1,3 +1,4 @@
+mod accounts;
 mod catalog;
 mod exchange;
 
@@ -18,11 +19,11 @@ use axum::{
     routing::{any, get},
 };
 use terminal_core::{
-    BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange, LastPrice, Market, MarketKind,
-    ServerMessage, SymbolInfo, Trade,
+    Account, AccountState, BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange,
+    LastPrice, Market, MarketKind, ServerMessage, SymbolInfo, Trade,
 };
 use tokio::{
-    sync::{Mutex, RwLock, broadcast, mpsc},
+    sync::{Mutex, RwLock, broadcast, mpsc, watch},
     task::JoinHandle,
 };
 use tower_http::services::ServeDir;
@@ -99,9 +100,58 @@ struct AppState {
     catalogs: Arc<RwLock<HashMap<(Exchange, MarketKind), CatalogEntry>>>,
     http: reqwest::Client,
     updates: broadcast::Sender<ServerMessage>,
+    accounts: Arc<RwLock<HashMap<Account, AccountState>>>,
+    account_users: Arc<Mutex<HashMap<Account, usize>>>,
+    account_control: watch::Sender<Vec<Account>>,
 }
 
 impl AppState {
+    async fn acquire_account(&self, account: Account) {
+        let mut users = self.account_users.lock().await;
+        *users.entry(account).or_default() += 1;
+        let mut accounts: Vec<_> = users.keys().cloned().collect();
+        accounts.sort_by(|left, right| left.address.cmp(&right.address));
+        self.account_control.send_replace(accounts);
+    }
+
+    async fn release_account(&self, account: &Account) {
+        let mut users = self.account_users.lock().await;
+        if let Some(count) = users.get_mut(account) {
+            *count -= 1;
+            if *count == 0 {
+                users.remove(account);
+                self.accounts.write().await.remove(account);
+            }
+        }
+        let mut accounts: Vec<_> = users.keys().cloned().collect();
+        accounts.sort_by(|left, right| left.address.cmp(&right.address));
+        self.account_control.send_replace(accounts);
+    }
+
+    async fn account_snapshot(&self, account: &Account) -> ServerMessage {
+        ServerMessage::AccountState {
+            account: account.clone(),
+            state: self
+                .accounts
+                .read()
+                .await
+                .get(account)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    async fn publish_account(&self, account: &Account, state: AccountState) {
+        self.accounts
+            .write()
+            .await
+            .insert(account.clone(), state.clone());
+        let _ = self.updates.send(ServerMessage::AccountState {
+            account: account.clone(),
+            state,
+        });
+    }
+
     async fn acquire(&self, market: Market) {
         let mut workers = self.workers.lock().await;
         if let Some(worker) = workers.get_mut(&market) {
@@ -376,6 +426,7 @@ async fn send(socket: &mut WebSocket, message: &ServerMessage) -> Result<(), axu
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut selected = HashSet::<Market>::new();
+    let mut selected_accounts = HashSet::<Account>::new();
     let mut updates = state.updates.subscribe();
     let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -385,6 +436,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(message) = serde_json::from_str::<ClientMessage>(&text) {
                         match message {
+                            ClientMessage::SubscribeAccount { account } => {
+                                if !account.valid() { continue; }
+                                if selected_accounts.insert(account.clone()) {
+                                    state.acquire_account(account.clone()).await;
+                                }
+                                if send(&mut socket, &state.account_snapshot(&account).await).await.is_err() {
+                                    break 'connection;
+                                }
+                            }
+                            ClientMessage::UnsubscribeAccount { account } => {
+                                if selected_accounts.remove(&account) {
+                                    state.release_account(&account).await;
+                                }
+                            }
                             ClientMessage::Subscribe { market } => {
                                 if selected.insert(market.clone()) {
                                     state.acquire(market.clone()).await;
@@ -421,8 +486,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     break 'connection;
                 }
             },
-            event = updates.recv(), if !selected.is_empty() => match event {
-                Ok(event) if event.market().is_some_and(|market| selected.contains(market)) => {
+            event = updates.recv(), if !selected.is_empty() || !selected_accounts.is_empty() => match event {
+                Ok(event) if event.market().is_some_and(|market| selected.contains(market))
+                    || matches!(&event, ServerMessage::AccountState { account, .. } if selected_accounts.contains(account)) => {
                     if send(&mut socket, &event).await.is_err() {
                         break 'connection;
                     }
@@ -430,6 +496,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     for market in &selected {
                         if send(&mut socket, &state.snapshot(market).await).await.is_err() {
+                            break 'connection;
+                        }
+                    }
+                    for account in &selected_accounts {
+                        if send(&mut socket, &state.account_snapshot(account).await).await.is_err() {
                             break 'connection;
                         }
                     }
@@ -442,6 +513,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     for market in selected {
         state.release(&market).await;
     }
+    for account in selected_accounts {
+        state.release_account(&account).await;
+    }
 }
 
 #[tokio::main]
@@ -450,13 +524,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+    let (account_control, account_rx) = watch::channel(Vec::new());
     let state = AppState {
         markets: Arc::default(),
         workers: Arc::default(),
         catalogs: Arc::default(),
         http,
         updates,
+        accounts: Arc::default(),
+        account_users: Arc::default(),
+        account_control,
     };
+    tokio::spawn(accounts::run(state.clone(), account_rx));
 
     let dist = std::env::var("TERMINAL_WEB_DIST").unwrap_or_else(|_| "crates/web/dist".to_owned());
     let app = Router::new()
@@ -480,12 +559,16 @@ mod tests {
 
     fn test_state() -> AppState {
         let (updates, _) = broadcast::channel(16);
+        let (account_control, _) = watch::channel(Vec::new());
         AppState {
             markets: Arc::default(),
             workers: Arc::default(),
             catalogs: Arc::default(),
             http: reqwest::Client::new(),
             updates,
+            accounts: Arc::default(),
+            account_users: Arc::default(),
+            account_control,
         }
     }
 

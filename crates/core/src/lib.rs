@@ -252,9 +252,58 @@ pub enum TradeSide {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Account {
+    pub exchange: Exchange,
+    pub address: String,
+}
+
+impl Account {
+    pub fn valid(&self) -> bool {
+        self.exchange == Exchange::Hyperliquid
+            && self.address.len() == 42
+            && self.address.starts_with("0x")
+            && self.address[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OwnOrder {
+    pub coin: String,
+    pub order_id: u64,
+    pub side: TradeSide,
+    pub price: String,
+    pub size: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    pub coin: String,
+    pub size: String,
+    pub entry_price: String,
+    pub unrealized_pnl: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountState {
+    pub orders: Vec<OwnOrder>,
+    pub positions: Vec<Position>,
+    pub connected: bool,
+    pub updated_at_ms: i64,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    SubscribeAccount {
+        account: Account,
+    },
+    UnsubscribeAccount {
+        account: Account,
+    },
     Subscribe {
         market: Market,
     },
@@ -270,6 +319,10 @@ pub enum ClientMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AccountState {
+        account: Account,
+        state: AccountState,
+    },
     Snapshot {
         market: Market,
         candles: Vec<Candle>,
@@ -329,6 +382,7 @@ impl ServerMessage {
             | Self::Trades { market, .. }
             | Self::Status { market, .. } => Some(market),
             Self::Symbols { .. } => None,
+            Self::AccountState { .. } => None,
         }
     }
 }
@@ -336,6 +390,29 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyperliquid_account_requires_wallet_address() {
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x0000000000000000000000000000000000000000".into(),
+        };
+        assert!(account.valid());
+        assert!(
+            !Account {
+                address: "0x1234".into(),
+                ..account.clone()
+            }
+            .valid()
+        );
+        assert!(
+            !Account {
+                exchange: Exchange::Binance,
+                ..account
+            }
+            .valid()
+        );
+    }
 
     #[test]
     fn old_market_selection_restores_its_exchange_symbol() {

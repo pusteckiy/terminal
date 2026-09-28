@@ -2,6 +2,8 @@
 
 A real-time crypto market-data terminal built in Rust. The interface runs in the browser through WebAssembly; a Rust server connects to exchange feeds and keeps the order books in sync. No JavaScript framework.
 
+Connect a Hyperliquid wallet address from the account button beside **Add widget** to see live open orders and perpetual positions. CHART marks orders and position entries; BOOK highlights own orders at levels present in Hyperliquid's depth feed. The account menu lists all open orders, including those beyond the book feed's 20 levels. This is read-only: no signing or API key is needed. Multiple wallet addresses can be saved locally in the browser. Hyperliquid limits live user subscriptions to 10 distinct addresses.
+
 ![Terminal with charts, price comparison, order books, and trades tape](docs/screenshots/overview.jpg)
 
 ## What it does

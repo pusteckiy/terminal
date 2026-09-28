@@ -12,8 +12,8 @@ use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 use terminal_core::{
-    BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange, LastPrice, Level, Market,
-    MarketKind, ServerMessage, SymbolInfo, Trade, TradeSide,
+    Account, AccountState, BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange,
+    LastPrice, Level, Market, MarketKind, ServerMessage, SymbolInfo, Trade, TradeSide,
 };
 
 // Dark neutral surfaces and control states follow the shadcn/ui color roles.
@@ -423,6 +423,12 @@ struct TerminalApp {
     catalog_errors: HashMap<(Exchange, MarketKind), String>,
     catalog_requests: HashSet<(Exchange, MarketKind)>,
     subscribed: HashSet<Market>,
+    accounts: Vec<Account>,
+    account_data: HashMap<Account, AccountState>,
+    subscribed_accounts: HashSet<Account>,
+    account_exchange: Exchange,
+    account_address: String,
+    account_error: Option<String>,
     focused: Option<TileId>,
     socket_open: bool,
     sender: Option<WsSender>,
@@ -482,6 +488,19 @@ impl TerminalApp {
             catalog_errors: HashMap::new(),
             catalog_requests: HashSet::new(),
             subscribed: HashSet::new(),
+            accounts: cc
+                .storage
+                .and_then(|storage| storage.get_string("accounts"))
+                .and_then(|saved| serde_json::from_str::<Vec<Account>>(&saved).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(Account::valid)
+                .collect(),
+            account_data: HashMap::new(),
+            subscribed_accounts: HashSet::new(),
+            account_exchange: Exchange::Hyperliquid,
+            account_address: String::new(),
+            account_error: None,
             focused: None,
             socket_open: false,
             sender: None,
@@ -521,6 +540,7 @@ impl TerminalApp {
                 self.receiver = Some(receiver);
                 self.socket_open = false;
                 self.subscribed.clear();
+                self.subscribed_accounts.clear();
                 self.catalog_requests.clear();
             }
             Err(_) => {
@@ -528,6 +548,7 @@ impl TerminalApp {
                 self.receiver = None;
                 self.socket_open = false;
                 self.subscribed.clear();
+                self.subscribed_accounts.clear();
                 self.catalog_requests.clear();
             }
         }
@@ -567,6 +588,26 @@ impl TerminalApp {
             self.send(ClientMessage::Subscribe { market });
         }
         self.subscribed = wanted;
+        let wanted_accounts: HashSet<_> = self.accounts.iter().cloned().collect();
+        for account in self
+            .subscribed_accounts
+            .difference(&wanted_accounts)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.send(ClientMessage::UnsubscribeAccount {
+                account: account.clone(),
+            });
+            self.account_data.remove(&account);
+        }
+        for account in wanted_accounts
+            .difference(&self.subscribed_accounts)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.send(ClientMessage::SubscribeAccount { account });
+        }
+        self.subscribed_accounts = wanted_accounts;
     }
 
     fn request_catalogs(
@@ -613,6 +654,12 @@ impl TerminalApp {
                                 self.catalog_errors.remove(&key);
                                 self.catalogs.insert(key, symbols);
                                 self.catalog_requests.remove(&key);
+                            }
+                            continue;
+                        }
+                        if let ServerMessage::AccountState { account, state } = message {
+                            if self.subscribed_accounts.contains(&account) {
+                                self.account_data.insert(account, state);
                             }
                             continue;
                         }
@@ -694,12 +741,15 @@ impl TerminalApp {
                                 }
                             }
                             ServerMessage::Symbols { .. } => {}
+                            ServerMessage::AccountState { .. } => {}
                         }
                     }
                 }
                 WsEvent::Closed | WsEvent::Error(_) => {
                     self.socket_open = false;
                     self.subscribed.clear();
+                    self.subscribed_accounts.clear();
+                    self.account_data.clear();
                     for data in self.data.values_mut() {
                         data.connected = false;
                         data.book = None;
@@ -893,6 +943,7 @@ impl TerminalApp {
                             );
                         });
                     response.on_hover_text("Add a widget beside the focused pane");
+                    self.account_menu(ui);
                 });
             },
         );
@@ -915,6 +966,198 @@ impl TerminalApp {
             self.switch_workspace(self.workspaces.len() - 1);
         }
         add
+    }
+
+    fn account_menu(&mut self, ui: &mut egui::Ui) {
+        let button = egui::Button::new("")
+            .fill(RAISED)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(29.0, 25.0));
+        let (response, _) = egui::menu::MenuButton::from_button(button)
+            .config(
+                egui::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
+                ui.set_min_width(290.0);
+                ui.label(
+                    RichText::new("ACCOUNTS")
+                        .monospace()
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("Read-only live orders and positions")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                ui.separator();
+                let mut remove = None;
+                if self.accounts.is_empty() {
+                    ui.label(RichText::new("No accounts connected").color(MUTED));
+                }
+                for (index, account) in self.accounts.iter().enumerate() {
+                    let state = self.account_data.get(account);
+                    ui.horizontal(|ui| {
+                        let status = state.is_some_and(|state| state.connected);
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                        ui.painter().circle_filled(
+                            dot.center(),
+                            3.0,
+                            if status { GREEN } else { MUTED },
+                        );
+                        ui.label(format!(
+                            "{}  {}…{}",
+                            account.exchange.label(),
+                            &account.address[..6],
+                            &account.address[account.address.len() - 4..]
+                        ))
+                        .on_hover_text(&account.address);
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Remove account")
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                    if let Some(state) = state {
+                        let description =
+                            state
+                                .error
+                                .as_deref()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| {
+                                    if state.connected {
+                                        format!(
+                                            "{} orders · {} positions · live",
+                                            state.orders.len(),
+                                            state.positions.len()
+                                        )
+                                    } else {
+                                        "Syncing current state…".to_owned()
+                                    }
+                                });
+                        ui.label(RichText::new(description).size(10.0).color(MUTED));
+                        if state.connected
+                            && (!state.orders.is_empty() || !state.positions.is_empty())
+                        {
+                            ui.collapsing("View live state", |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        for position in &state.positions {
+                                            let long = !position.size.starts_with('-');
+                                            ui.colored_label(
+                                                if long { GREEN } else { RED },
+                                                format!(
+                                                    "{} {} {} @ {} · PnL {}",
+                                                    position.coin,
+                                                    if long { "LONG" } else { "SHORT" },
+                                                    position.size,
+                                                    position.entry_price,
+                                                    position.unrealized_pnl
+                                                ),
+                                            );
+                                        }
+                                        for order in &state.orders {
+                                            ui.colored_label(
+                                                if order.side == TradeSide::Buy {
+                                                    GREEN
+                                                } else {
+                                                    RED
+                                                },
+                                                format!(
+                                                    "{} {} {} @ {}",
+                                                    order.coin,
+                                                    if order.side == TradeSide::Buy {
+                                                        "BUY"
+                                                    } else {
+                                                        "SELL"
+                                                    },
+                                                    order.size,
+                                                    order.price
+                                                ),
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                    }
+                }
+                if let Some(index) = remove {
+                    self.accounts.remove(index);
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new("CONNECT ACCOUNT")
+                        .monospace()
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("Use the trading or sub-account address")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                egui::ComboBox::from_id_salt("account-exchange")
+                    .selected_text(self.account_exchange.label())
+                    .show_ui(ui, |ui| {
+                        for exchange in Exchange::ALL {
+                            ui.add_enabled_ui(exchange == Exchange::Hyperliquid, |ui| {
+                                ui.selectable_value(
+                                    &mut self.account_exchange,
+                                    exchange,
+                                    exchange.label(),
+                                );
+                            });
+                        }
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.account_address)
+                        .hint_text("0x wallet address")
+                        .desired_width(270.0),
+                );
+                if let Some(error) = &self.account_error {
+                    ui.label(RichText::new(error).size(11.0).color(RED));
+                }
+                if ui.button("Connect account").clicked() {
+                    let account = Account {
+                        exchange: self.account_exchange,
+                        address: self.account_address.trim().to_ascii_lowercase(),
+                    };
+                    if !account.valid() {
+                        self.account_error = Some("Enter a valid 0x wallet address".into());
+                    } else if self.accounts.contains(&account) {
+                        self.account_error = Some("This account is already connected".into());
+                    } else {
+                        self.accounts.push(account);
+                        self.account_address.clear();
+                        self.account_error = None;
+                    }
+                }
+            });
+        let painter = ui.painter();
+        let center = response.rect.center();
+        painter.circle_stroke(
+            center + egui::vec2(0.0, -3.0),
+            2.6,
+            egui::Stroke::new(1.35, TEXT),
+        );
+        painter.add(egui::epaint::PathShape::line(
+            vec![
+                center + egui::vec2(-5.3, 5.0),
+                center + egui::vec2(-4.0, 2.0),
+                center + egui::vec2(-1.7, 0.9),
+                center + egui::vec2(1.7, 0.9),
+                center + egui::vec2(4.0, 2.0),
+                center + egui::vec2(5.3, 5.0),
+            ],
+            egui::Stroke::new(1.35, TEXT),
+        ));
+        response.on_hover_text("Accounts");
     }
 
     fn switch_workspace(&mut self, index: usize) {
@@ -1248,6 +1491,7 @@ fn market_editor(
 
 struct PaneBehavior<'a> {
     data: &'a HashMap<Market, MarketData>,
+    account_data: &'a HashMap<Account, AccountState>,
     catalogs: &'a HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     catalog_errors: &'a HashMap<(Exchange, MarketKind), String>,
     needed_catalogs: &'a mut HashSet<(Exchange, MarketKind)>,
@@ -1363,15 +1607,38 @@ impl Behavior<Pane> for PaneBehavior<'_> {
         }
         ui.separator();
         let data = self.data.get(&pane.market);
+        let market = &pane.market;
+        let own_orders: Vec<_> = self
+            .account_data
+            .iter()
+            .filter(|(account, state)| account.exchange == market.exchange && state.connected)
+            .flat_map(|(account, state)| {
+                state.orders.iter().filter_map(move |order| {
+                    (order.coin == market.symbol).then_some((account, order))
+                })
+            })
+            .collect();
+        let positions: Vec<_> = self
+            .account_data
+            .iter()
+            .filter(|(account, state)| account.exchange == market.exchange && state.connected)
+            .flat_map(|(account, state)| {
+                state.positions.iter().filter_map(move |position| {
+                    (market.kind == MarketKind::Perp && position.coin == market.symbol)
+                        .then_some((account, position))
+                })
+            })
+            .collect();
         match pane.kind {
             WidgetKind::Chart => {
                 let candles = data.map_or(&[][..], |data| data.candles.as_slice());
-                view::chart_ui(ui, candles, &mut pane.chart);
+                view::chart_ui(ui, candles, &mut pane.chart, &own_orders, &positions);
             }
             WidgetKind::Book => view::book_ui(
                 ui,
                 data.and_then(|data| data.book.as_ref()),
                 &mut pane.book_view,
+                &own_orders,
             ),
             WidgetKind::Compare => view::compare_ui(
                 ui,
@@ -1443,6 +1710,7 @@ impl eframe::App for TerminalApp {
             {
                 let mut behavior = PaneBehavior {
                     data: &self.data,
+                    account_data: &self.account_data,
                     catalogs: &self.catalogs,
                     catalog_errors: &self.catalog_errors,
                     needed_catalogs: &mut needed_catalogs,
@@ -1467,6 +1735,9 @@ impl eframe::App for TerminalApp {
         if let Ok(workspaces) = serde_json::to_string(&self.workspaces) {
             storage.set_string("terminal_workspaces", workspaces);
             storage.set_string("active_terminal", self.active_workspace.to_string());
+        }
+        if let Ok(accounts) = serde_json::to_string(&self.accounts) {
+            storage.set_string("accounts", accounts);
         }
     }
 }
@@ -1548,6 +1819,12 @@ mod tests {
             catalog_errors: HashMap::new(),
             catalog_requests: HashSet::new(),
             subscribed: HashSet::new(),
+            accounts: Vec::new(),
+            account_data: HashMap::new(),
+            subscribed_accounts: HashSet::new(),
+            account_exchange: Exchange::Hyperliquid,
+            account_address: String::new(),
+            account_error: None,
             focused: None,
             socket_open: false,
             sender: None,

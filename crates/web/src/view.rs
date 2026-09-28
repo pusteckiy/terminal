@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use terminal_core::{Book, Candle, Exchange, Level, Market, Trade, TradeSide};
+use terminal_core::{
+    Account, Book, Candle, Exchange, Level, Market, OwnOrder, Position, Trade, TradeSide,
+};
 
 use crate::{CompareMode, MAX_TAPE_TRADES, MarketData, TradePoint};
 
@@ -255,7 +257,13 @@ fn time_text(timestamp: i64) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-pub fn chart_ui(ui: &mut egui::Ui, candles: &[Candle], view: &mut ChartView) {
+pub fn chart_ui(
+    ui: &mut egui::Ui,
+    candles: &[Candle],
+    view: &mut ChartView,
+    orders: &[(&Account, &OwnOrder)],
+    positions: &[(&Account, &Position)],
+) {
     let available = ui.available_size();
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(available.x.max(1.0), available.y.max(1.0)),
@@ -263,6 +271,38 @@ pub fn chart_ui(ui: &mut egui::Ui, candles: &[Candle], view: &mut ChartView) {
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, PANEL);
+    if !orders.is_empty() || !positions.is_empty() {
+        let position = positions.first().map(|(_, position)| {
+            format!(
+                " · {} {} @ {} · PnL {}",
+                if position.size.starts_with('-') {
+                    "SHORT"
+                } else {
+                    "LONG"
+                },
+                compact_decimal(&position.size),
+                compact_decimal(&position.entry_price),
+                compact_decimal(&position.unrealized_pnl)
+            )
+        });
+        painter
+            .with_clip_rect(Rect::from_min_max(
+                Pos2::new(rect.left() + 12.0, rect.top()),
+                Pos2::new(rect.right() - 12.0, rect.top() + 26.0),
+            ))
+            .text(
+                Pos2::new(rect.left() + 14.0, rect.top() + 12.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "OWN  {} orders · {} positions{}",
+                    orders.len(),
+                    positions.len(),
+                    position.unwrap_or_default()
+                ),
+                FontId::monospace(10.0),
+                MUTED,
+            );
+    }
     if candles.is_empty() {
         painter.text(
             rect.center(),
@@ -275,7 +315,15 @@ pub fn chart_ui(ui: &mut egui::Ui, candles: &[Candle], view: &mut ChartView) {
     }
 
     let plot = Rect::from_min_max(
-        Pos2::new(rect.left() + 14.0, rect.top() + 12.0),
+        Pos2::new(
+            rect.left() + 14.0,
+            rect.top()
+                + if orders.is_empty() && positions.is_empty() {
+                    12.0
+                } else {
+                    29.0
+                },
+        ),
         Pos2::new(rect.right() - 76.0, rect.bottom() - 31.0),
     );
     if plot.width() < 80.0 || plot.height() < 80.0 {
@@ -402,6 +450,71 @@ pub fn chart_ui(ui: &mut egui::Ui, candles: &[Candle], view: &mut ChartView) {
         );
     }
 
+    for (account, order) in orders {
+        let Ok(price) = order.price.parse::<f64>() else {
+            continue;
+        };
+        if price < floor || price > ceiling {
+            continue;
+        }
+        let y = y_for(price);
+        let color = if order.side == TradeSide::Buy {
+            GREEN
+        } else {
+            RED
+        };
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.0, color.gamma_multiply(0.75)),
+        );
+        painter.text(
+            Pos2::new(plot.left() + 5.0, y - 2.0),
+            Align2::LEFT_BOTTOM,
+            format!(
+                "{} {} · {}",
+                if order.side == TradeSide::Buy {
+                    "BUY"
+                } else {
+                    "SELL"
+                },
+                compact_decimal(&order.size),
+                &account.address[account.address.len() - 4..]
+            ),
+            FontId::monospace(10.0),
+            color,
+        );
+    }
+    for (account, position) in positions {
+        let Ok(price) = position.entry_price.parse::<f64>() else {
+            continue;
+        };
+        if price < floor || price > ceiling {
+            continue;
+        }
+        let y = y_for(price);
+        let color = Color32::from_rgb(94, 193, 255);
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.3, color),
+        );
+        painter.text(
+            Pos2::new(plot.right() - 4.0, y - 2.0),
+            Align2::RIGHT_BOTTOM,
+            format!(
+                "{} {} · {}",
+                if position.size.starts_with('-') {
+                    "SHORT"
+                } else {
+                    "LONG"
+                },
+                compact_decimal(&position.size),
+                &account.address[account.address.len() - 4..]
+            ),
+            FontId::monospace(10.0),
+            color,
+        );
+    }
+
     for tick in 0..=4 {
         let index = ((visible.len() - 1) * tick / 4).min(visible.len() - 1);
         let x = plot.left() + (index as f32 + 0.5) * step;
@@ -449,7 +562,12 @@ pub fn chart_ui(ui: &mut egui::Ui, candles: &[Candle], view: &mut ChartView) {
     }
 }
 
-pub fn book_ui(ui: &mut egui::Ui, book: Option<&Book>, view: &mut BookView) {
+pub fn book_ui(
+    ui: &mut egui::Ui,
+    book: Option<&Book>,
+    view: &mut BookView,
+    orders: &[(&Account, &OwnOrder)],
+) {
     let size = ui.available_size();
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(size.x.max(1.0), size.y.max(1.0)), Sense::hover());
@@ -493,6 +611,15 @@ pub fn book_ui(ui: &mut egui::Ui, book: Option<&Book>, view: &mut BookView) {
         FontId::monospace(10.0),
         MUTED,
     );
+    if !orders.is_empty() {
+        painter.text(
+            Pos2::new(left + 48.0, rect.top() + 16.0),
+            Align2::LEFT_CENTER,
+            format!("OWN {}", orders.len()),
+            FontId::monospace(9.0),
+            Color32::from_rgb(94, 193, 255),
+        );
+    }
     painter.text(
         Pos2::new(base_right, rect.top() + 16.0),
         Align2::RIGHT_CENTER,
@@ -583,8 +710,11 @@ pub fn book_ui(ui: &mut egui::Ui, book: Option<&Book>, view: &mut BookView) {
             level,
             max_size,
             RED,
-            selection.is_some_and(|selection| index <= selection.index),
-            selection.is_some_and(|selection| index == selection.index),
+            BookRowState {
+                in_depth: selection.is_some_and(|selection| index <= selection.index),
+                hovered: selection.is_some_and(|selection| index == selection.index),
+                own_count: own_orders_at(orders, level, TradeSide::Sell),
+            },
         );
     }
 
@@ -665,14 +795,17 @@ pub fn book_ui(ui: &mut egui::Ui, book: Option<&Book>, view: &mut BookView) {
             level,
             max_size,
             GREEN,
-            selection.is_some_and(|selection| index <= selection.index),
-            selection.is_some_and(|selection| index == selection.index),
+            BookRowState {
+                in_depth: selection.is_some_and(|selection| index <= selection.index),
+                hovered: selection.is_some_and(|selection| index == selection.index),
+                own_count: own_orders_at(orders, level, TradeSide::Buy),
+            },
         );
     }
     if footer_height > 0.0
         && let Some(selection) = selected
     {
-        book_inspector(&painter, footer, book, selection);
+        book_inspector(&painter, footer, book, selection, orders);
     }
 }
 
@@ -729,23 +862,40 @@ fn book_value_width(total_width: f32) -> f32 {
     ((total_width - 92.0) / 2.0).clamp(60.0, 110.0)
 }
 
+struct BookRowState {
+    in_depth: bool,
+    hovered: bool,
+    own_count: usize,
+}
+
 fn book_row(
     painter: &egui::Painter,
     row: Rect,
     level: &Level,
     max_size: f64,
     color: Color32,
-    in_depth: bool,
-    hovered: bool,
+    state: BookRowState,
 ) {
     let left = row.left();
     let right = row.right();
     let y = row.center().y;
-    if in_depth {
+    if state.in_depth {
         painter.rect_filled(
             row,
             0.0,
-            color.gamma_multiply(if hovered { 0.22 } else { 0.09 }),
+            color.gamma_multiply(if state.hovered { 0.22 } else { 0.09 }),
+        );
+    }
+    if state.own_count > 0 {
+        painter.rect_filled(
+            row,
+            0.0,
+            Color32::from_rgb(94, 193, 255).gamma_multiply(0.10),
+        );
+        painter.circle_filled(
+            Pos2::new(left + 4.0, y),
+            2.6,
+            Color32::from_rgb(94, 193, 255),
         );
     }
     let size = level.size.parse::<f64>().unwrap_or_default();
@@ -769,7 +919,7 @@ fn book_row(
             Pos2::new(price_right - 3.0, row_bottom),
         ))
         .text(
-            Pos2::new(left + 2.0, y),
+            Pos2::new(left + if state.own_count > 0 { 11.0 } else { 2.0 }, y),
             Align2::LEFT_CENTER,
             compact_decimal(&level.price),
             FontId::monospace(11.0),
@@ -806,6 +956,18 @@ fn book_row(
         );
 }
 
+fn own_orders_at(orders: &[(&Account, &OwnOrder)], level: &Level, side: TradeSide) -> usize {
+    let Ok(price) = level.price.parse::<rust_decimal::Decimal>() else {
+        return 0;
+    };
+    orders
+        .iter()
+        .filter(|(_, order)| {
+            order.side == side && order.price.parse::<rust_decimal::Decimal>().ok() == Some(price)
+        })
+        .count()
+}
+
 fn execution_metrics(level: &Level, best_price: f64) -> Option<(f64, f64)> {
     let price = level.price.parse::<f64>().ok()?;
     let depth_base = level.depth_base.parse::<f64>().ok()?;
@@ -824,7 +986,13 @@ fn execution_price_text(price: f64) -> String {
     compact_decimal(&text).to_owned()
 }
 
-fn book_inspector(painter: &egui::Painter, footer: Rect, book: &Book, selection: BookSelection) {
+fn book_inspector(
+    painter: &egui::Painter,
+    footer: Rect,
+    book: &Book,
+    selection: BookSelection,
+    orders: &[(&Account, &OwnOrder)],
+) {
     painter.rect_filled(footer, 0.0, crate::RAISED);
     painter.line_segment(
         [footer.left_top(), footer.right_top()],
@@ -845,6 +1013,15 @@ fn book_inspector(painter: &egui::Painter, footer: Rect, book: &Book, selection:
     };
     let best_price = best_price.price.parse::<f64>().unwrap_or_default();
     let (percent, weighted_price) = execution_metrics(level, best_price).unwrap_or((0.0, 0.0));
+    let own_count = own_orders_at(
+        orders,
+        level,
+        if selection.side == BookSide::Ask {
+            TradeSide::Sell
+        } else {
+            TradeSide::Buy
+        },
+    );
     let total = match selection.side {
         BookSide::Ask => book.asks.len(),
         BookSide::Bid => book.bids.len(),
@@ -861,6 +1038,15 @@ fn book_inspector(painter: &egui::Painter, footer: Rect, book: &Book, selection:
         FontId::monospace(11.0),
         color,
     );
+    if own_count > 0 {
+        content.text(
+            Pos2::new(footer.right() - 12.0, lines[0]),
+            Align2::RIGHT_CENTER,
+            format!("{own_count} OWN"),
+            FontId::monospace(10.0),
+            Color32::from_rgb(94, 193, 255),
+        );
+    }
     content.text(
         Pos2::new(left, lines[1]),
         Align2::LEFT_CENTER,
@@ -1417,9 +1603,40 @@ pub fn compare_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        book_scroll_bounds, execution_metrics, quote_size_text, simplify_points, trade_utc,
+        book_scroll_bounds, execution_metrics, own_orders_at, quote_size_text, simplify_points,
+        trade_utc,
     };
-    use terminal_core::Level;
+    use terminal_core::{Account, Exchange, Level, OwnOrder, TradeSide};
+
+    #[test]
+    fn own_book_marker_matches_exact_price_and_side() {
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x0000000000000000000000000000000000000000".into(),
+        };
+        let order = OwnOrder {
+            coin: "BTC".into(),
+            order_id: 1,
+            side: TradeSide::Buy,
+            price: "100.000".into(),
+            size: "1".into(),
+        };
+        let level = Level {
+            price: "100".into(),
+            size: "2".into(),
+            quote_size: "200".into(),
+            depth_base: "2".into(),
+            depth_quote: "200".into(),
+        };
+        assert_eq!(
+            own_orders_at(&[(&account, &order)], &level, TradeSide::Buy),
+            1
+        );
+        assert_eq!(
+            own_orders_at(&[(&account, &order)], &level, TradeSide::Sell),
+            0
+        );
+    }
 
     #[test]
     fn trade_times_display_in_utc_with_milliseconds() {
