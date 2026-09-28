@@ -37,6 +37,9 @@ fn venue_code(exchange: Exchange) -> &'static str {
         Exchange::Hyperliquid => "HYP",
         Exchange::Gate => "GAT",
         Exchange::Lighter => "LTR",
+        Exchange::Bitget => "BGT",
+        Exchange::Aster => "AST",
+        Exchange::Bitunix => "BUX",
     }
 }
 

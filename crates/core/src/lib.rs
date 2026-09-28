@@ -10,16 +10,22 @@ pub enum Exchange {
     Hyperliquid,
     Gate,
     Lighter,
+    Bitget,
+    Aster,
+    Bitunix,
 }
 
 impl Exchange {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::Binance,
         Self::Okx,
         Self::Bybit,
         Self::Hyperliquid,
         Self::Gate,
         Self::Lighter,
+        Self::Bitget,
+        Self::Aster,
+        Self::Bitunix,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -30,12 +36,17 @@ impl Exchange {
             Self::Hyperliquid => "Hyperliquid",
             Self::Gate => "Gate",
             Self::Lighter => "Lighter",
+            Self::Bitget => "Bitget",
+            Self::Aster => "Aster",
+            Self::Bitunix => "Bitunix",
         }
     }
 
     pub const fn default_symbol(self, kind: MarketKind) -> &'static str {
         match (self, kind) {
-            (Self::Binance | Self::Bybit, _) => "BTCUSDT",
+            (Self::Binance | Self::Bybit | Self::Bitget | Self::Aster | Self::Bitunix, _) => {
+                "BTCUSDT"
+            }
             (Self::Okx, MarketKind::Spot) => "BTC-USDT",
             (Self::Okx, MarketKind::Perp) => "BTC-USDT-SWAP",
             (Self::Hyperliquid, MarketKind::Spot) => "PURR/USDC",
@@ -90,7 +101,7 @@ impl Default for Market {
 impl Market {
     pub fn for_exchange(exchange: Exchange) -> Self {
         let kind = match exchange {
-            Exchange::Hyperliquid | Exchange::Lighter => MarketKind::Perp,
+            Exchange::Hyperliquid | Exchange::Lighter | Exchange::Bitunix => MarketKind::Perp,
             _ => MarketKind::Spot,
         };
         Self::for_exchange_kind(exchange, kind)
@@ -129,7 +140,14 @@ impl<'de> Deserialize<'de> for Market {
         let symbol = saved.symbol.unwrap_or_else(|| {
             let eth = matches!(saved.asset, Some(LegacyAsset::Eth));
             match (saved.exchange, eth) {
-                (Exchange::Binance | Exchange::Bybit, true) => "ETHUSDT",
+                (
+                    Exchange::Binance
+                    | Exchange::Bybit
+                    | Exchange::Bitget
+                    | Exchange::Aster
+                    | Exchange::Bitunix,
+                    true,
+                ) => "ETHUSDT",
                 (Exchange::Okx, true) => "ETH-USDT",
                 (Exchange::Hyperliquid, true) => "ETH",
                 (Exchange::Gate, true) => "ETH_USDT",
@@ -164,6 +182,8 @@ pub struct SymbolInfo {
     pub market_id: Option<u32>,
     #[serde(default)]
     pub size_multiplier: Option<String>,
+    #[serde(default)]
+    pub price_step: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

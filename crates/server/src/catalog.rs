@@ -90,6 +90,45 @@ pub async fn fetch(
                 .json()
                 .await?
         }
+        Exchange::Bitget => {
+            client
+                .get(if kind == MarketKind::Spot {
+                    "https://api.bitget.com/api/v2/spot/public/symbols"
+                } else {
+                    "https://api.bitget.com/api/v2/mix/market/contracts?productType=usdt-futures"
+                })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        Exchange::Aster => {
+            client
+                .get(if kind == MarketKind::Spot {
+                    "https://sapi.asterdex.com/api/v3/exchangeInfo"
+                } else {
+                    "https://fapi.asterdex.com/fapi/v3/exchangeInfo"
+                })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        Exchange::Bitunix => {
+            client
+                .get(if kind == MarketKind::Spot {
+                    "https://openapi.bitunix.com/api/spot/v1/common/coin_pair/list"
+                } else {
+                    "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs"
+                })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
     };
     let mut symbols = parse(exchange, kind, &response)?;
     if exchange == Exchange::Bybit && kind == MarketKind::Perp {
@@ -131,6 +170,8 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
         Exchange::Hyperliquid => &response["universe"],
         Exchange::Gate => response,
         Exchange::Lighter => &response["order_books"],
+        Exchange::Bitget | Exchange::Bitunix => &response["data"],
+        Exchange::Aster => &response["symbols"],
     }
     .as_array()
     .ok_or_else(|| std::io::Error::other("invalid symbol catalog response"))?;
@@ -241,13 +282,59 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
                         None,
                     )
                 }
+                Exchange::Bitget => (
+                    if kind == MarketKind::Spot {
+                        row["status"] == "online"
+                    } else {
+                        row["symbolStatus"] == "normal" && row["symbolType"] == "perpetual"
+                    },
+                    row["symbol"].as_str()?,
+                    row["baseCoin"].as_str()?,
+                    row["quoteCoin"].as_str()?,
+                    None,
+                    None,
+                ),
+                Exchange::Aster => (
+                    row["status"] == "TRADING"
+                        && (kind == MarketKind::Spot || row["contractType"] == "PERPETUAL"),
+                    row["symbol"].as_str()?,
+                    row["baseAsset"].as_str()?,
+                    row["quoteAsset"].as_str()?,
+                    None,
+                    None,
+                ),
+                Exchange::Bitunix if kind == MarketKind::Spot => (
+                    row["isOpen"] == 1,
+                    row["symbol"].as_str()?,
+                    row["base"].as_str()?,
+                    row["quote"].as_str()?,
+                    None,
+                    None,
+                ),
+                Exchange::Bitunix => (
+                    row["symbolStatus"] == "OPEN" && row["isApiSupported"] == true,
+                    row["symbol"].as_str()?,
+                    row["base"].as_str()?,
+                    row["quote"].as_str()?,
+                    None,
+                    None,
+                ),
             };
             enabled.then(|| SymbolInfo {
-                symbol: symbol.to_owned(),
+                symbol: if exchange == Exchange::Bitunix && kind == MarketKind::Spot {
+                    symbol.to_ascii_uppercase()
+                } else {
+                    symbol.to_owned()
+                },
                 base: base.to_owned(),
                 quote: quote.to_owned(),
                 market_id,
                 size_multiplier,
+                price_step: if exchange == Exchange::Bitunix && kind == MarketKind::Spot {
+                    row["precisions"][0].as_str().map(str::to_owned)
+                } else {
+                    None
+                },
             })
         })
         .collect::<Vec<_>>();
@@ -261,6 +348,42 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_venue_catalogs_select_active_spot_and_perpetual_symbols() {
+        let bitget_spot = json!({"data":[{"symbol":"BTCUSDT","baseCoin":"BTC","quoteCoin":"USDT","status":"online"},{"symbol":"OLDUSDT","baseCoin":"OLD","quoteCoin":"USDT","status":"offline"}]});
+        assert_eq!(
+            parse(Exchange::Bitget, MarketKind::Spot, &bitget_spot)
+                .unwrap()
+                .len(),
+            1
+        );
+        let bitget_perp = json!({"data":[{"symbol":"BTCUSDT","baseCoin":"BTC","quoteCoin":"USDT","symbolStatus":"normal","symbolType":"perpetual"},{"symbol":"ETHUSDT","baseCoin":"ETH","quoteCoin":"USDT","symbolStatus":"offline","symbolType":"perpetual"}]});
+        assert_eq!(
+            parse(Exchange::Bitget, MarketKind::Perp, &bitget_perp)
+                .unwrap()
+                .len(),
+            1
+        );
+        let aster = json!({"symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","status":"TRADING","contractType":"PERPETUAL"},{"symbol":"ETHUSDT","baseAsset":"ETH","quoteAsset":"USDT","status":"TRADING","contractType":"CURRENT_QUARTER"}]});
+        assert_eq!(
+            parse(Exchange::Aster, MarketKind::Perp, &aster)
+                .unwrap()
+                .len(),
+            1
+        );
+        let bitunix_spot = json!({"data":[{"symbol":"btcusdt","base":"BTC","quote":"USDT","isOpen":1,"precisions":["0.01","0.1"]}]});
+        let symbols = parse(Exchange::Bitunix, MarketKind::Spot, &bitunix_spot).unwrap();
+        assert_eq!(symbols[0].symbol, "BTCUSDT");
+        assert_eq!(symbols[0].price_step.as_deref(), Some("0.01"));
+        let bitunix_perp = json!({"data":[{"symbol":"BTCUSDT","base":"BTC","quote":"USDT","symbolStatus":"OPEN","isApiSupported":true}]});
+        assert_eq!(
+            parse(Exchange::Bitunix, MarketKind::Perp, &bitunix_perp)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn catalogs_keep_only_active_symbols() {

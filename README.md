@@ -6,7 +6,7 @@ A real-time crypto market-data terminal built in Rust. The interface runs in the
 
 ## What it does
 
-- **Six exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, and Lighter. Choose Spot or Perp and a symbol separately for each widget.
+- **Nine exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, Lighter, Bitget, Aster, and Bitunix. Choose Spot or Perp and a symbol separately for each widget.
 - **Four widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, and trades tape.
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
@@ -28,7 +28,7 @@ Open **http://127.0.0.1:3000**. Run `cargo test --workspace` to check the projec
 
 ## Scope
 
-Perp support covers linear contracts: Binance USDⓈ-M, OKX linear swaps, Bybit linear, Gate USDT, Hyperliquid, and Lighter. Inverse contracts are not included. Binance Perp publishes aggregate trade events, so its tape shows each published aggregate rather than every underlying execution. Order books contain the price levels available from each exchange's public feed; they do not expose individual orders. The terminal displays public market data and does not place trades.
+Perp support covers linear contracts: Binance USDⓈ-M, OKX linear swaps, Bybit linear, Gate USDT, Hyperliquid, Lighter, Bitget USDT, Aster, and Bitunix USDT. Inverse contracts are not included. Binance and Aster Perp publish aggregate trade events, so their tapes show each published aggregate rather than every underlying execution. Bitunix Spot currently provides a polled public order book and candle history; its public API does not expose a trade stream, so its trade tape and Last Trades comparison are unavailable. Order books contain the price levels available from each exchange's public feed; they do not expose individual orders. The terminal displays public market data and does not place trades.
 
 ## Project
 

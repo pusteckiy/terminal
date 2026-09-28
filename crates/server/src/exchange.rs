@@ -74,7 +74,9 @@ fn decimal(value: &Value) -> Option<Decimal> {
 
 fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
     let (rows, price, size, time): (&[Value], &str, &str, &str) = match exchange {
-        Exchange::Binance if value["e"] == "trade" || value["e"] == "aggTrade" => {
+        Exchange::Binance | Exchange::Aster
+            if value["e"] == "trade" || value["e"] == "aggTrade" =>
+        {
             (std::slice::from_ref(value), "p", "q", "T")
         }
         Exchange::Okx if value["arg"]["channel"] == "trades" => (
@@ -123,26 +125,48 @@ fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
                 "timestamp",
             )
         }
+        Exchange::Bitget if value["arg"]["channel"] == "trade" => (
+            value["data"].as_array().map_or(&[], Vec::as_slice),
+            "price",
+            "size",
+            "ts",
+        ),
+        Exchange::Bitunix if value["ch"] == "trade" => (
+            value["data"].as_array().map_or(&[], Vec::as_slice),
+            "p",
+            "v",
+            "ts",
+        ),
         _ => return Vec::new(),
     };
     rows.iter()
         .filter_map(|row| {
             let price = decimal(&row[price])?;
             let raw_size = decimal(&row[size])?;
+            if price <= Decimal::ZERO {
+                return None;
+            }
             let size = if exchange == Exchange::Gate && value["channel"] == "futures.trades" {
                 raw_size.abs()
+            } else if exchange == Exchange::Aster && value["e"] == "trade" {
+                // Aster Spot's q is quote quantity; the tape and candle volume use base units.
+                raw_size / price
             } else {
                 raw_size
             };
-            if price <= Decimal::ZERO || size <= Decimal::ZERO {
+            if size <= Decimal::ZERO {
                 return None;
             }
             Some(Trade {
                 price: price.normalize().to_string(),
                 size: size.normalize().to_string(),
-                time_ms: integer(&row[time]).unwrap_or_else(now_ms),
+                time_ms: if exchange == Exchange::Bitunix {
+                    integer(&value["ts"]).unwrap_or_else(now_ms)
+                } else {
+                    integer(&row[time]).unwrap_or_else(now_ms)
+                },
                 side: match exchange {
-                    Exchange::Binance => match row["m"].as_bool() {
+                    Exchange::Binance | Exchange::Aster => match row["m"].as_bool() {
                         Some(true) => TradeSide::Sell,
                         Some(false) => TradeSide::Buy,
                         None => TradeSide::Unknown,
@@ -179,6 +203,19 @@ fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
                         Some(false) => TradeSide::Sell,
                         None => TradeSide::Unknown,
                     },
+                    Exchange::Bitget | Exchange::Bitunix => {
+                        match row[if exchange == Exchange::Bitget {
+                            "side"
+                        } else {
+                            "s"
+                        }]
+                        .as_str()
+                        {
+                            Some("buy") => TradeSide::Buy,
+                            Some("sell") => TradeSide::Sell,
+                            _ => TradeSide::Unknown,
+                        }
+                    }
                 },
             })
         })
@@ -285,6 +322,7 @@ impl BookAccumulator {
                         .or_else(|| decimal(&row["p"])),
                     decimal(&row["sz"])
                         .or_else(|| decimal(&row["size"]))
+                        .or_else(|| decimal(&row["volume"]))
                         .or_else(|| decimal(&row["s"])),
                 )
             };
@@ -373,6 +411,28 @@ fn book_changes(rows: &Value, multiplier: Decimal) -> Vec<BookChange> {
     })
 }
 
+fn changed_levels(
+    old: &BTreeMap<Decimal, Decimal>,
+    new: &BTreeMap<Decimal, Decimal>,
+    multiplier: Decimal,
+) -> Vec<BookChange> {
+    old.iter()
+        .filter(|(price, _)| !new.contains_key(price))
+        .map(|(price, _)| BookChange {
+            price: price.normalize().to_string(),
+            size: "0".to_owned(),
+        })
+        .chain(
+            new.iter()
+                .filter(|(price, size)| old.get(price) != Some(size))
+                .map(|(price, size)| BookChange {
+                    price: price.normalize().to_string(),
+                    size: (*size * multiplier).normalize().to_string(),
+                }),
+        )
+        .collect()
+}
+
 fn spawn_deep_snapshot(
     market: &Market,
     state: &AppState,
@@ -381,18 +441,30 @@ fn spawn_deep_snapshot(
     let market = market.clone();
     tokio::spawn(async move {
         let response = match market.exchange {
-            Exchange::Binance => {
+            Exchange::Binance | Exchange::Aster => {
                 client
-                    .get(if market.kind == MarketKind::Spot {
-                        "https://api.binance.com/api/v3/depth"
-                    } else {
-                        "https://fapi.binance.com/fapi/v1/depth"
+                    .get(match (market.exchange, market.kind) {
+                        (Exchange::Binance, MarketKind::Spot) => {
+                            "https://api.binance.com/api/v3/depth"
+                        }
+                        (Exchange::Binance, MarketKind::Perp) => {
+                            "https://fapi.binance.com/fapi/v1/depth"
+                        }
+                        (Exchange::Aster, MarketKind::Spot) => {
+                            "https://sapi.asterdex.com/api/v3/depth"
+                        }
+                        (Exchange::Aster, MarketKind::Perp) => {
+                            "https://fapi.asterdex.com/fapi/v3/depth"
+                        }
+                        _ => unreachable!(),
                     })
                     .query(&[
                         ("symbol", market.symbol.as_str()),
                         (
                             "limit",
-                            if market.kind == MarketKind::Spot {
+                            if market.kind == MarketKind::Spot
+                                && market.exchange == Exchange::Binance
+                            {
                                 "5000"
                             } else {
                                 "1000"
@@ -433,7 +505,7 @@ fn spawn_deep_snapshot(
 
 fn deep_update_ids(exchange: Exchange, value: &Value) -> Option<(i64, i64)> {
     match exchange {
-        Exchange::Binance => Some((integer(&value["U"])?, integer(&value["u"])?)),
+        Exchange::Binance | Exchange::Aster => Some((integer(&value["U"])?, integer(&value["u"])?)),
         Exchange::Bybit => {
             let id = integer(&value["data"]["u"])?;
             Some((id, id))
@@ -459,17 +531,18 @@ fn apply_deep_delta(
     if last <= previous {
         return Ok(false);
     }
-    if exchange == Exchange::Binance
-        && kind == MarketKind::Perp
+    if (exchange == Exchange::Binance && kind == MarketKind::Perp || exchange == Exchange::Aster)
         && integer(&value["pu"]) != Some(previous)
     {
-        return Err(std::io::Error::other("Binance perpetual book sequence gap").into());
+        return Err(std::io::Error::other("depth stream sequence gap").into());
     }
-    if first > previous + 1 || (exchange == Exchange::Bybit && last != previous + 1) {
+    if (exchange != Exchange::Aster && first > previous + 1)
+        || (exchange == Exchange::Bybit && last != previous + 1)
+    {
         return Err(std::io::Error::other("deep book sequence gap").into());
     }
     let (bids, asks) = match exchange {
-        Exchange::Binance => (&value["b"], &value["a"]),
+        Exchange::Binance | Exchange::Aster => (&value["b"], &value["a"]),
         Exchange::Bybit => (&value["data"]["b"], &value["data"]["a"]),
         _ => unreachable!(),
     };
@@ -488,7 +561,7 @@ fn initialize_deep_book(
     book: &mut BookAccumulator,
 ) -> Result<bool, Error> {
     let (bids, asks, id) = match exchange {
-        Exchange::Binance => (
+        Exchange::Binance | Exchange::Aster => (
             &snapshot["bids"],
             &snapshot["asks"],
             integer(&snapshot["lastUpdateId"]),
@@ -517,7 +590,11 @@ fn initialize_deep_book(
         .find(|event| deep_update_ids(exchange, event).is_some_and(|(_, last)| last > id))
     {
         let (first, _) = deep_update_ids(exchange, first_new).unwrap();
-        if first > id + 1
+        if exchange == Exchange::Aster {
+            if integer(&first_new["pu"]).is_none_or(|previous| previous > id) {
+                return Ok(false);
+            }
+        } else if first > id + 1
             || (exchange == Exchange::Binance && kind == MarketKind::Perp && first > id)
         {
             return Ok(false);
@@ -527,7 +604,10 @@ fn initialize_deep_book(
     // preceding stream event rather than the snapshot ID.
     let mut first_applied = false;
     for event in buffered.iter() {
-        if exchange == Exchange::Binance && kind == MarketKind::Perp && !first_applied {
+        if ((exchange == Exchange::Binance && kind == MarketKind::Perp)
+            || exchange == Exchange::Aster)
+            && !first_applied
+        {
             let Some((_, last)) = deep_update_ids(exchange, event) else {
                 continue;
             };
@@ -596,7 +676,9 @@ fn apply_gate_obu(data: &Value, book: &mut BookAccumulator) -> Result<bool, Erro
 
 pub async fn run_books(market: Market, state: AppState) {
     loop {
-        let result = if market.exchange == Exchange::Binance && market.kind == MarketKind::Perp {
+        let result = if market.exchange == Exchange::Bitunix && market.kind == MarketKind::Spot {
+            poll_bitunix_spot_book(&market, &state).await
+        } else if market.exchange == Exchange::Binance && market.kind == MarketKind::Perp {
             tokio::select! {
                 result = stream_books(&market, &state) => result,
                 _ = run_binance_perp_trades(&market, &state) => Err(std::io::Error::other("Binance perpetual trade stream stopped").into()),
@@ -613,6 +695,49 @@ pub async fn run_books(market: Market, state: AppState) {
         }
         state.disconnected(&market).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn poll_bitunix_spot_book(market: &Market, state: &AppState) -> Result<(), Error> {
+    let step = state
+        .symbols(Exchange::Bitunix, MarketKind::Spot)
+        .await
+        .map_err(std::io::Error::other)?
+        .into_iter()
+        .find(|info| info.symbol == market.symbol)
+        .and_then(|info| info.price_step)
+        .ok_or_else(|| std::io::Error::other("Bitunix Spot precision unavailable"))?;
+    loop {
+        let value: Value = state
+            .http
+            .get("https://openapi.bitunix.com/api/spot/v1/market/depth")
+            .query(&[
+                ("symbol", market.symbol.as_str()),
+                ("precision", step.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if value["code"] != 0 && value["code"] != "0" {
+            return Err(std::io::Error::other("Bitunix Spot depth rejected").into());
+        }
+        let data = &value["data"];
+        let mut book = BookAccumulator::default();
+        if book.replace(&data["bids"], &data["asks"], None)
+            && !book.bids.is_empty()
+            && !book.asks.is_empty()
+            && !book.is_crossed()
+        {
+            state
+                .publish_book(
+                    market,
+                    book.book(integer(&data["ts"]).unwrap_or_else(now_ms)),
+                )
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 }
 
@@ -655,16 +780,31 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
         None
     };
     let url = match market.exchange {
-        Exchange::Binance => {
+        Exchange::Binance | Exchange::Aster => {
             if market.kind == MarketKind::Spot {
                 format!(
-                    "wss://stream.binance.com:9443/stream?streams={symbol}@depth@100ms/{symbol}@trade",
+                    "{host}/stream?streams={symbol}@depth@100ms/{symbol}@trade",
+                    host = if market.exchange == Exchange::Aster {
+                        "wss://sstream.asterdex.com"
+                    } else {
+                        "wss://stream.binance.com:9443"
+                    },
                     symbol = symbol.to_ascii_lowercase()
                 )
             } else {
                 format!(
-                    "wss://fstream.binance.com/public/stream?streams={symbol}@depth@100ms",
-                    symbol = symbol.to_ascii_lowercase()
+                    "{host}/stream?streams={symbol}@depth@100ms{trades}",
+                    host = if market.exchange == Exchange::Aster {
+                        "wss://fstream.asterdex.com"
+                    } else {
+                        "wss://fstream.binance.com/public"
+                    },
+                    symbol = symbol.to_ascii_lowercase(),
+                    trades = if market.exchange == Exchange::Aster {
+                        format!("/{}@aggTrade", symbol.to_ascii_lowercase())
+                    } else {
+                        String::new()
+                    },
                 )
             }
         }
@@ -685,6 +825,8 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
         }
         .to_owned(),
         Exchange::Lighter => "wss://mainnet.zklighter.elliot.ai/stream".to_owned(),
+        Exchange::Bitget => "wss://ws.bitget.com/v2/ws/public".to_owned(),
+        Exchange::Bitunix => "wss://fapi.bitunix.com/public/".to_owned(),
     };
     let mut request = url.into_client_request()?;
     if market.exchange == Exchange::Gate && market.kind == MarketKind::Perp {
@@ -694,7 +836,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
     }
     let (mut socket, _) = connect_async(request).await?;
     let subscriptions = match market.exchange {
-        Exchange::Binance => vec![],
+        Exchange::Binance | Exchange::Aster => vec![],
         Exchange::Okx => vec![json!({"op":"subscribe","args":[
             {"channel":"books","instId":symbol},
             {"channel":"trades","instId":symbol}
@@ -752,6 +894,14 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                 })
             })
             .collect(),
+        Exchange::Bitget => vec![json!({"op":"subscribe","args":[
+            {"instType":if market.kind == MarketKind::Spot { "SPOT" } else { "USDT-FUTURES" },"channel":"books","instId":symbol},
+            {"instType":if market.kind == MarketKind::Spot { "SPOT" } else { "USDT-FUTURES" },"channel":"trade","instId":symbol}
+        ]})],
+        Exchange::Bitunix => vec![json!({"op":"subscribe","args":[
+            {"symbol":symbol,"ch":"depth_books"},
+            {"symbol":symbol,"ch":"trade"}
+        ]})],
     };
     for subscription in subscriptions {
         socket
@@ -786,12 +936,15 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
         match frame? {
             Message::Text(text) => {
                 let envelope: Value = serde_json::from_str(&text)?;
-                let value = if market.exchange == Exchange::Binance {
+                let value = if matches!(market.exchange, Exchange::Binance | Exchange::Aster) {
                     &envelope["data"]
                 } else {
                     &envelope
                 };
                 let mut trades = parse_trades(market.exchange, value);
+                if market.exchange == Exchange::Bitget && value["action"] == "snapshot" {
+                    trades.reverse();
+                }
                 if !trades.is_empty() {
                     if multiplier != Decimal::ONE {
                         for trade in &mut trades {
@@ -816,7 +969,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                     state.publish_best_bid_ask(market, quote).await;
                 }
                 let deep_delta = match market.exchange {
-                    Exchange::Binance => value["e"] == "depthUpdate",
+                    Exchange::Binance | Exchange::Aster => value["e"] == "depthUpdate",
                     Exchange::Bybit => value["topic"]
                         .as_str()
                         .is_some_and(|topic| topic.starts_with("orderbook.full.")),
@@ -833,17 +986,22 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                     continue;
                 }
                 let stamp = match market.exchange {
-                    Exchange::Binance => integer(&value["E"]),
+                    Exchange::Binance | Exchange::Aster => integer(&value["E"]),
                     Exchange::Okx => integer(&value["data"][0]["ts"]),
                     Exchange::Bybit => integer(&value["ts"]),
                     Exchange::Hyperliquid => integer(&value["data"]["time"]),
                     Exchange::Gate => integer(&value["result"]["t"]),
                     Exchange::Lighter => integer(&value["timestamp"]),
+                    Exchange::Bitget => {
+                        integer(&value["data"][0]["ts"]).or_else(|| integer(&value["ts"]))
+                    }
+                    Exchange::Bitunix => integer(&value["ts"]),
                 }
                 .unwrap_or_else(now_ms);
                 let mut delta_rows: Option<(&Value, &Value)> = None;
+                let mut full_snapshot_changes: Option<(Vec<BookChange>, Vec<BookChange>)> = None;
                 let ready = match market.exchange {
-                    Exchange::Binance => {
+                    Exchange::Binance | Exchange::Aster => {
                         if deep_delta
                             && apply_deep_delta(market.exchange, market.kind, value, &mut book)?
                         {
@@ -934,13 +1092,66 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                             false
                         }
                     }
+                    Exchange::Bitget => {
+                        if value["arg"]["channel"] != "books" {
+                            false
+                        } else {
+                            let data = &value["data"][0];
+                            let seq = integer(&data["seq"]).ok_or_else(|| {
+                                std::io::Error::other("Bitget book lacks sequence ID")
+                            })?;
+                            if value["action"] == "snapshot" {
+                                book.replace(&data["bids"], &data["asks"], Some(seq))
+                            } else if value["action"] == "update" {
+                                if book.ready && book.sequence != integer(&data["pseq"]) {
+                                    return Err(
+                                        std::io::Error::other("Bitget book sequence gap").into()
+                                    );
+                                }
+                                let updated = book.update(&data["bids"], &data["asks"]);
+                                if updated {
+                                    book.sequence = Some(seq);
+                                    delta_rows = Some((&data["bids"], &data["asks"]));
+                                }
+                                updated
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                    Exchange::Bitunix => {
+                        if value["ch"] == "depth_books" {
+                            let old_bids = std::mem::take(&mut book.bids);
+                            let old_asks = std::mem::take(&mut book.asks);
+                            let was_ready = book.ready;
+                            if !book.replace(&value["data"]["b"], &value["data"]["a"], None) {
+                                return Err(std::io::Error::other("invalid Bitunix book").into());
+                            }
+                            if was_ready {
+                                full_snapshot_changes = Some((
+                                    changed_levels(&old_bids, &book.bids, multiplier),
+                                    changed_levels(&old_asks, &book.asks, multiplier),
+                                ));
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
                 };
                 if ready {
+                    if book.is_crossed() {
+                        return Err(std::io::Error::other("crossed order book").into());
+                    }
                     if matches!(market.exchange, Exchange::Okx | Exchange::Gate) {
                         book.retain_top(400);
                     }
                     let current = book.book_scaled(stamp, multiplier);
-                    if let Some((bids, asks)) = delta_rows
+                    if let Some((bids, asks)) = full_snapshot_changes {
+                        if !bids.is_empty() || !asks.is_empty() {
+                            state.publish_book_delta(market, current, bids, asks).await;
+                        }
+                    } else if let Some((bids, asks)) = delta_rows
                         .filter(|_| !matches!(market.exchange, Exchange::Okx | Exchange::Gate))
                     {
                         state
@@ -996,12 +1207,22 @@ async fn fetch_candles(
         .to_f64()
         .unwrap_or(1.0);
     let value: Value = match market.exchange {
-        Exchange::Binance => {
+        Exchange::Binance | Exchange::Aster => {
             client
-                .get(if market.kind == MarketKind::Spot {
-                    "https://api.binance.com/api/v3/klines"
-                } else {
-                    "https://fapi.binance.com/fapi/v1/klines"
+                .get(match (market.exchange, market.kind) {
+                    (Exchange::Binance, MarketKind::Spot) => {
+                        "https://api.binance.com/api/v3/klines"
+                    }
+                    (Exchange::Binance, MarketKind::Perp) => {
+                        "https://fapi.binance.com/fapi/v1/klines"
+                    }
+                    (Exchange::Aster, MarketKind::Spot) => {
+                        "https://sapi.asterdex.com/api/v3/klines"
+                    }
+                    (Exchange::Aster, MarketKind::Perp) => {
+                        "https://fapi.asterdex.com/fapi/v3/klines"
+                    }
+                    _ => unreachable!(),
                 })
                 .query(&[("symbol", symbol), ("interval", "1m"), ("limit", "300")])
                 .send()
@@ -1098,13 +1319,72 @@ async fn fetch_candles(
                 .json()
                 .await?
         }
+        Exchange::Bitget => {
+            let request = client
+                .get(if market.kind == MarketKind::Spot {
+                    "https://api.bitget.com/api/v2/spot/market/candles"
+                } else {
+                    "https://api.bitget.com/api/v2/mix/market/candles"
+                })
+                .query(&[
+                    ("symbol", symbol),
+                    (
+                        "granularity",
+                        if market.kind == MarketKind::Spot {
+                            "1min"
+                        } else {
+                            "1m"
+                        },
+                    ),
+                    ("limit", "300"),
+                ]);
+            let request = if market.kind == MarketKind::Perp {
+                request.query(&[("productType", "usdt-futures")])
+            } else {
+                request
+            };
+            request.send().await?.error_for_status()?.json().await?
+        }
+        Exchange::Bitunix => {
+            client
+                .get(if market.kind == MarketKind::Spot {
+                    "https://openapi.bitunix.com/api/spot/v1/market/kline/history"
+                } else {
+                    "https://fapi.bitunix.com/api/v1/futures/market/kline"
+                })
+                .query(&[
+                    ("symbol", symbol),
+                    (
+                        "interval",
+                        if market.kind == MarketKind::Spot {
+                            "1"
+                        } else {
+                            "1m"
+                        },
+                    ),
+                    (
+                        "limit",
+                        if market.kind == MarketKind::Spot {
+                            "300"
+                        } else {
+                            "200"
+                        },
+                    ),
+                ])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
     };
     let rows = match market.exchange {
-        Exchange::Binance | Exchange::Hyperliquid => &value,
+        Exchange::Binance | Exchange::Aster | Exchange::Hyperliquid => &value,
         Exchange::Okx => &value["data"],
         Exchange::Bybit => &value["result"]["list"],
         Exchange::Gate => &value,
         Exchange::Lighter => &value["c"],
+        Exchange::Bitget | Exchange::Bitunix => &value["data"],
     };
     let mut candles = rows
         .as_array()
@@ -1124,7 +1404,25 @@ async fn fetch_candles(
 
 fn parse_candle(exchange: Exchange, kind: MarketKind, row: &Value) -> Option<Candle> {
     let (time, open, high, low, close, volume) =
-        if exchange == Exchange::Hyperliquid || exchange == Exchange::Lighter {
+        if exchange == Exchange::Bitunix && kind == MarketKind::Spot {
+            (
+                &row["ts"],
+                &row["open"],
+                &row["high"],
+                &row["low"],
+                &row["close"],
+                &row["volume"],
+            )
+        } else if exchange == Exchange::Bitunix {
+            (
+                &row["time"],
+                &row["open"],
+                &row["high"],
+                &row["low"],
+                &row["close"],
+                &row["baseVol"],
+            )
+        } else if exchange == Exchange::Hyperliquid || exchange == Exchange::Lighter {
             (
                 &row["t"], &row["o"], &row["h"], &row["l"], &row["c"], &row["v"],
             )
@@ -1140,6 +1438,8 @@ fn parse_candle(exchange: Exchange, kind: MarketKind, row: &Value) -> Option<Can
     Some(Candle {
         time: if exchange == Exchange::Gate {
             integer(time)?
+        } else if exchange == Exchange::Bitunix && kind == MarketKind::Spot {
+            parse_utc_seconds(time.as_str()?)?
         } else {
             integer(time)? / 1000
         },
@@ -1151,9 +1451,140 @@ fn parse_candle(exchange: Exchange, kind: MarketKind, row: &Value) -> Option<Can
     })
 }
 
+fn parse_utc_seconds(value: &str) -> Option<i64> {
+    let (date, clock) = value.split_once('T')?;
+    let mut parts = date.split('-');
+    let (mut year, month, day) = (
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<i64>().ok()?,
+    );
+    let clock = clock.strip_suffix('Z')?;
+    let mut parts = clock.split(':');
+    let (hour, minute, second) = (
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.split('.').next()?.parse::<i64>().ok()?,
+    );
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    year -= i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_venue_trade_and_candle_formats() {
+        let bitget = json!({"arg":{"channel":"trade"},"data":[{"price":"100.2","size":"0.3","ts":"1700000000123","side":"buy"}]});
+        let trade = &parse_trades(Exchange::Bitget, &bitget)[0];
+        assert_eq!(
+            (trade.price.as_str(), trade.size.as_str(), trade.side),
+            ("100.2", "0.3", TradeSide::Buy)
+        );
+        let aster = json!({"e":"aggTrade","p":"100.2","q":"0.3","T":1700000000123_i64,"m":true});
+        assert_eq!(
+            parse_trades(Exchange::Aster, &aster)[0].side,
+            TradeSide::Sell
+        );
+        let aster_spot =
+            json!({"e":"trade","p":"0.72908","q":"242.78","T":1790540535671_i64,"m":true});
+        let size = parse_trades(Exchange::Aster, &aster_spot)[0]
+            .size
+            .parse::<f64>()
+            .unwrap();
+        assert!((size - 332.99500741).abs() < 0.00001);
+        let bitunix = json!({"ch":"trade","ts":1700000000123_i64,"data":[{"p":"100.2","v":"0.3","s":"sell","t":"2023-11-14T22:13:20Z"}]});
+        assert_eq!(
+            parse_trades(Exchange::Bitunix, &bitunix)[0].side,
+            TradeSide::Sell
+        );
+        assert_eq!(
+            parse_trades(Exchange::Bitunix, &bitunix)[0].time_ms,
+            1700000000123
+        );
+        let spot = json!({"ts":"2023-11-14T22:13:00Z","open":"100","high":"102","low":"99","close":"101","volume":"3"});
+        assert_eq!(
+            parse_candle(Exchange::Bitunix, MarketKind::Spot, &spot)
+                .unwrap()
+                .time,
+            1700000000 - 20
+        );
+        let perp = json!({"time":"1700000000000","open":"100","high":"102","low":"99","close":"101","baseVol":"3"});
+        assert_eq!(
+            parse_candle(Exchange::Bitunix, MarketKind::Perp, &perp)
+                .unwrap()
+                .volume,
+            3.0
+        );
+        let mut spot_book = BookAccumulator::default();
+        assert!(spot_book.replace(
+            &json!([{"price":"100","volume":"2"}]),
+            &json!([{"price":"101","volume":"3"}]),
+            None,
+        ));
+        assert_eq!(spot_book.book(1).bids[0].size, "2");
+    }
+
+    #[test]
+    fn aster_depth_uses_previous_event_id_when_update_ids_skip() {
+        let snapshot = json!({"lastUpdateId":100,"bids":[["100","1"]],"asks":[["101","1"]]});
+        let first = json!({"U":105,"u":105,"pu":99,"b":[["100","2"]],"a":[]});
+        let mut buffered = VecDeque::from([first]);
+        let mut book = BookAccumulator::default();
+        assert!(
+            initialize_deep_book(
+                Exchange::Aster,
+                MarketKind::Spot,
+                &snapshot,
+                &mut buffered,
+                &mut book
+            )
+            .unwrap()
+        );
+        assert_eq!(book.sequence, Some(105));
+        let next = json!({"U":110,"u":110,"pu":105,"b":[["99","3"]],"a":[]});
+        assert!(apply_deep_delta(Exchange::Aster, MarketKind::Spot, &next, &mut book).unwrap());
+        let gap = json!({"U":120,"u":120,"pu":109,"b":[],"a":[]});
+        assert!(apply_deep_delta(Exchange::Aster, MarketKind::Spot, &gap, &mut book).is_err());
+    }
+
+    #[test]
+    fn full_book_snapshots_send_only_changed_levels() {
+        let old = BTreeMap::from([
+            (Decimal::from(100), Decimal::from(2)),
+            (Decimal::from(99), Decimal::from(1)),
+        ]);
+        let new = BTreeMap::from([
+            (Decimal::from(100), Decimal::from(3)),
+            (Decimal::from(98), Decimal::from(4)),
+        ]);
+        let changes = changed_levels(&old, &new, Decimal::ONE);
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .any(|row| row.price == "99" && row.size == "0")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|row| row.price == "100" && row.size == "3")
+        );
+    }
 
     #[test]
     fn parses_hyperliquid_bbo_for_live_price_comparison() {
