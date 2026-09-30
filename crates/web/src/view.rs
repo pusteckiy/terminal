@@ -182,6 +182,96 @@ pub struct ChartView {
     visible: usize,
     offset: usize,
     drag_remainder: f32,
+    y_axis: YAxisView,
+}
+
+#[derive(Default)]
+pub struct YAxisView {
+    manual: Option<(f64, f64)>,
+}
+
+impl YAxisView {
+    fn pan(&mut self, bounds: (f64, f64), delta_y: f32, height: f32) {
+        if delta_y.abs() < 0.01 {
+            return;
+        }
+        let shift = f64::from(delta_y / height) * (bounds.1 - bounds.0);
+        self.manual = Some((bounds.0 + shift, bounds.1 + shift));
+    }
+
+    fn zoom(&mut self, bounds: (f64, f64), scroll: f32, anchor: f64) {
+        let span = bounds.1 - bounds.0;
+        let value = bounds.0 + anchor * span;
+        let min_span = value.abs().max(1.0) * 1e-10;
+        let next_span = (span * (-f64::from(scroll) * 0.005).exp()).max(min_span);
+        let next = (
+            value - anchor * next_span,
+            value + (1.0 - anchor) * next_span,
+        );
+        if next.0.is_finite() && next.1.is_finite() && next.1 > next.0 {
+            self.manual = Some(next);
+        }
+    }
+
+    fn interact(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        rect: Rect,
+        plot: Rect,
+        auto: (f64, f64),
+        wheel_on_plot: bool,
+    ) -> (f64, f64) {
+        let axis = Rect::from_min_max(
+            Pos2::new(plot.right(), plot.top()),
+            Pos2::new(rect.right(), plot.bottom()),
+        );
+        let active = plot.union(axis);
+        let bounds = self.manual.unwrap_or(auto);
+        if response.dragged_by(egui::PointerButton::Primary)
+            && ui.input(|input| {
+                input
+                    .pointer
+                    .press_origin()
+                    .is_some_and(|p| active.contains(p))
+            })
+        {
+            self.pan(
+                bounds,
+                ui.input(|input| input.pointer.delta().y),
+                plot.height(),
+            );
+        }
+        if let Some(pointer) = response.hover_pos().filter(|p| active.contains(*p)) {
+            let on_axis = axis.contains(pointer);
+            let (scroll, shift) = ui.input(|input| {
+                let delta = input.smooth_scroll_delta;
+                let shift = input.modifiers.shift;
+                (
+                    if shift && delta.y.abs() < 0.01 {
+                        delta.x
+                    } else {
+                        delta.y
+                    },
+                    shift,
+                )
+            });
+            if scroll.abs() > 0.01 && (on_axis || wheel_on_plot || shift) {
+                let anchor = f64::from((plot.bottom() - pointer.y) / plot.height()).clamp(0.0, 1.0);
+                self.zoom(self.manual.unwrap_or(auto), scroll, anchor);
+            }
+            if on_axis {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                response
+                    .clone()
+                    .on_hover_text("Drag to move price · Scroll to zoom · Double-click to reset");
+                if response.double_clicked() {
+                    self.manual = None;
+                }
+            }
+        }
+        self.manual.unwrap_or(auto)
+    }
 }
 
 #[derive(Default)]
@@ -333,7 +423,10 @@ pub fn chart_ui(
     if view.visible == 0 {
         view.visible = 90;
     }
-    if response.hovered() {
+    if response.hovered()
+        && response.hover_pos().is_some_and(|p| plot.contains(p))
+        && !ui.input(|input| input.modifiers.shift)
+    {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll.abs() > 0.5 {
             let change = if scroll > 0.0 { -5 } else { 5 };
@@ -342,7 +435,14 @@ pub fn chart_ui(
     }
     view.offset = view.offset.min(candles.len().saturating_sub(1));
     let step = plot.width() / view.visible as f32;
-    if response.dragged_by(egui::PointerButton::Primary) {
+    if response.dragged_by(egui::PointerButton::Primary)
+        && ui.input(|input| {
+            input
+                .pointer
+                .press_origin()
+                .is_some_and(|p| plot.contains(p))
+        })
+    {
         view.drag_remainder += ui.input(|input| input.pointer.delta().x);
         let moved = (view.drag_remainder / step).trunc() as isize;
         if moved != 0 {
@@ -367,14 +467,22 @@ pub fn chart_ui(
         .fold(f64::NEG_INFINITY, f64::max);
     let low = visible.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
     let padding = ((high - low) * 0.07).max(high.abs() * 0.0001);
-    let ceiling = high + padding;
-    let floor = low - padding;
     let price_area = Rect::from_min_max(
         plot.min,
         Pos2::new(plot.right(), plot.top() + plot.height() * 0.76),
     );
     let volume_area =
         Rect::from_min_max(Pos2::new(plot.left(), price_area.bottom() + 12.0), plot.max);
+    let (floor, ceiling) = view.y_axis.interact(
+        ui,
+        &response,
+        rect,
+        price_area,
+        (low - padding, high + padding),
+        false,
+    );
+    let price_painter = painter.with_clip_rect(price_area);
+    let volume_painter = painter.with_clip_rect(volume_area);
     let y_for = |price: f64| {
         price_area.bottom() - ((price - floor) / (ceiling - floor)) as f32 * price_area.height()
     };
@@ -422,7 +530,7 @@ pub fn chart_ui(
         } else {
             RED
         };
-        painter.line_segment(
+        price_painter.line_segment(
             [
                 Pos2::new(x, y_for(candle.high)),
                 Pos2::new(x, y_for(candle.low)),
@@ -431,7 +539,7 @@ pub fn chart_ui(
         );
         let top = y_for(candle.open.max(candle.close));
         let bottom = y_for(candle.open.min(candle.close)).max(top + 1.5);
-        painter.rect_filled(
+        price_painter.rect_filled(
             Rect::from_min_max(
                 Pos2::new(x - bar_width / 2.0, top),
                 Pos2::new(x + bar_width / 2.0, bottom),
@@ -440,7 +548,7 @@ pub fn chart_ui(
             color,
         );
         let volume_height = (candle.volume / max_volume) as f32 * (volume_area.height() - 12.0);
-        painter.rect_filled(
+        volume_painter.rect_filled(
             Rect::from_min_max(
                 Pos2::new(x - bar_width / 2.0, volume_area.bottom() - volume_height),
                 Pos2::new(x + bar_width / 2.0, volume_area.bottom()),
@@ -450,6 +558,8 @@ pub fn chart_ui(
         );
     }
 
+    let pointer = response.hover_pos().filter(|p| price_area.contains(*p));
+    let mut hovered_order: Option<(f32, &Account, &OwnOrder, f32)> = None;
     for (account, order) in orders {
         let Ok(price) = order.price.parse::<f64>() else {
             continue;
@@ -463,26 +573,25 @@ pub fn chart_ui(
         } else {
             RED
         };
-        painter.line_segment(
+        price_painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-            Stroke::new(1.0, color.gamma_multiply(0.75)),
+            Stroke::new(1.0, color.gamma_multiply(0.35)),
         );
-        painter.text(
-            Pos2::new(plot.left() + 5.0, y - 2.0),
-            Align2::LEFT_BOTTOM,
-            format!(
-                "{} {} · {}",
-                if order.side == TradeSide::Buy {
-                    "BUY"
-                } else {
-                    "SELL"
-                },
-                compact_decimal(&order.size),
-                &account.address[account.address.len() - 4..]
-            ),
-            FontId::monospace(10.0),
+        price_painter.rect_filled(
+            Rect::from_center_size(Pos2::new(plot.right() - 2.0, y), Vec2::splat(4.0)),
+            1.0,
             color,
         );
+        if let Some(pointer) = pointer {
+            let distance = (pointer.y - y).abs();
+            if distance <= 5.0
+                && hovered_order
+                    .as_ref()
+                    .is_none_or(|(best, _, _, _)| distance < *best)
+            {
+                hovered_order = Some((distance, account, order, y));
+            }
+        }
     }
     for (account, position) in positions {
         let Ok(price) = position.entry_price.parse::<f64>() else {
@@ -493,11 +602,11 @@ pub fn chart_ui(
         }
         let y = y_for(price);
         let color = Color32::from_rgb(94, 193, 255);
-        painter.line_segment(
+        price_painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
             Stroke::new(1.3, color),
         );
-        painter.text(
+        price_painter.text(
             Pos2::new(plot.right() - 4.0, y - 2.0),
             Align2::RIGHT_BOTTOM,
             format!(
@@ -509,6 +618,29 @@ pub fn chart_ui(
                 },
                 compact_decimal(&position.size),
                 &account.address[account.address.len() - 4..]
+            ),
+            FontId::monospace(10.0),
+            color,
+        );
+    }
+
+    if let Some((_, account, order, y)) = hovered_order {
+        let color = trade_color(order.side, MUTED);
+        price_painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.4, color),
+        );
+        let header = Rect::from_min_max(rect.min, Pos2::new(rect.right(), price_area.top()));
+        painter.rect_filled(header, 0.0, PANEL);
+        painter.with_clip_rect(header).text(
+            Pos2::new(rect.left() + 14.0, rect.top() + 12.0),
+            Align2::LEFT_CENTER,
+            format!(
+                "ORDER {} {} × {} · …{}",
+                trade_side_label(order.side),
+                order.price,
+                order.size,
+                &account.address[account.address.len().saturating_sub(4)..]
             ),
             FontId::monospace(10.0),
             color,
@@ -1289,14 +1421,15 @@ fn compare_sources_table(
                         font.clone(),
                         color,
                     );
-                response.on_hover_text(match mode {
+                let details = match mode {
                     CompareMode::Trades => format!("{name} · Last {}", last.unwrap_or("—")),
                     CompareMode::BestBidAsk => format!(
                         "{name} · Bid {} · Ask {}",
                         bid.unwrap_or("—"),
                         last.unwrap_or("—")
                     ),
-                });
+                };
+                response.on_hover_text(details);
             }
         });
 }
@@ -1308,13 +1441,17 @@ pub fn compare_ui(
     mode: CompareMode,
     percent: bool,
     window_secs: u32,
+    orders: &[(usize, &Account, &OwnOrder)],
+    view: &mut YAxisView,
 ) {
     compare_sources_table(ui, markets, data, mode, window_secs);
     ui.add_space(4.0);
 
     let size = ui.available_size();
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(size.x.max(1.0), size.y.max(1.0)), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(size.x.max(1.0), size.y.max(1.0)),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, PANEL);
     let plot = Rect::from_min_max(
@@ -1410,8 +1547,8 @@ pub fn compare_ui(
     }
     let percent = percent && mode == CompareMode::Trades;
     let pad = ((high - low) * 0.08).max(if percent { 0.01 } else { high.abs() * 0.0001 });
-    let floor = low - pad;
-    let ceiling = high + pad;
+    let (floor, ceiling) = view.interact(ui, &response, rect, plot, (low - pad, high + pad), true);
+    let plot_painter = painter.with_clip_rect(plot);
     let x_for = |time: i64| {
         plot.left() + (time - start_ms) as f32 / (end_ms - start_ms) as f32 * plot.width()
     };
@@ -1466,7 +1603,7 @@ pub fn compare_ui(
             .then(|| simplify_points(points, start_ms, end_ms, plot.width().ceil() as usize));
         let points = simplified.as_deref().unwrap_or(points);
         for pair in points.windows(2) {
-            painter.line_segment(
+            plot_painter.line_segment(
                 [
                     Pos2::new(x_for(pair[0].0), y_for(pair[0].1)),
                     Pos2::new(x_for(pair[1].0), y_for(pair[1].1)),
@@ -1477,9 +1614,49 @@ pub fn compare_ui(
         if mode == CompareMode::BestBidAsk
             && let Some((time, price)) = points.last()
         {
-            painter.circle_filled(Pos2::new(x_for(*time), y_for(*price)), 2.5, *color);
+            plot_painter.circle_filled(Pos2::new(x_for(*time), y_for(*price)), 2.5, *color);
         }
     }
+    let order_levels: Vec<_> = orders
+        .iter()
+        .filter_map(|(index, account, order)| {
+            let market = markets.get(*index)?;
+            let base = if percent {
+                data.get(market)?
+                    .price_trades
+                    .iter()
+                    .find(|trade| trade.time_ms >= cutoff_ms)
+                    .map(|trade| trade.price)?
+            } else {
+                1.0
+            };
+            let value = order_plot_value(&order.price, base, percent)?;
+            (floor..=ceiling)
+                .contains(&value)
+                .then_some((*index, *account, *order, y_for(value)))
+        })
+        .collect();
+    for (_, _, order, y) in &order_levels {
+        let color = trade_color(order.side, MUTED);
+        plot_painter.line_segment(
+            [Pos2::new(plot.left(), *y), Pos2::new(plot.right(), *y)],
+            Stroke::new(1.0, color.gamma_multiply(0.35)),
+        );
+        plot_painter.rect_filled(
+            Rect::from_center_size(Pos2::new(plot.right(), *y), Vec2::splat(5.0)),
+            1.0,
+            color,
+        );
+    }
+    let hovered_order = response
+        .hover_pos()
+        .filter(|pointer| plot.contains(*pointer))
+        .and_then(|pointer| {
+            order_levels
+                .iter()
+                .filter(|(_, _, _, y)| (pointer.y - *y).abs() <= 5.0)
+                .min_by(|a, b| (pointer.y - a.3).abs().total_cmp(&(pointer.y - b.3).abs()))
+        });
     if mode == CompareMode::Trades {
         for (index, market) in markets.iter().enumerate() {
             let Some(market_data) = data.get(market) else {
@@ -1505,7 +1682,11 @@ pub fn compare_ui(
             let visible_count = 1 + trades.clone().count();
             if visible_count <= plot.width() as usize * 2 {
                 for trade in std::iter::once(first).chain(trades) {
-                    painter.circle_filled(position(trade), 1.8, trade_color(trade.side, fallback));
+                    plot_painter.circle_filled(
+                        position(trade),
+                        1.8,
+                        trade_color(trade.side, fallback),
+                    );
                 }
             } else {
                 // One dot per horizontal pixel keeps dense tape streams responsive.
@@ -1514,7 +1695,7 @@ pub fn compare_ui(
                 for trade in trades {
                     let next_column = position(trade).x as i32;
                     if next_column != column {
-                        painter.circle_filled(
+                        plot_painter.circle_filled(
                             position(pending),
                             1.8,
                             trade_color(pending.side, fallback),
@@ -1523,10 +1704,18 @@ pub fn compare_ui(
                     }
                     pending = trade;
                 }
-                painter.circle_filled(position(pending), 1.8, trade_color(pending.side, fallback));
+                plot_painter.circle_filled(
+                    position(pending),
+                    1.8,
+                    trade_color(pending.side, fallback),
+                );
             }
             if let Some(latest) = market_data.price_trades.back() {
-                painter.circle_filled(position(latest), 2.8, trade_color(latest.side, fallback));
+                plot_painter.circle_filled(
+                    position(latest),
+                    2.8,
+                    trade_color(latest.side, fallback),
+                );
             }
         }
     }
@@ -1538,7 +1727,7 @@ pub fn compare_ui(
             ],
             Stroke::new(1.0, MUTED),
         );
-        if mode == CompareMode::Trades {
+        if mode == CompareMode::Trades && hovered_order.is_none() {
             let mut nearest: Option<(f32, &Market, &TradePoint, Pos2, usize)> = None;
             for (index, market) in markets.iter().enumerate() {
                 let Some(market_data) = data.get(market) else {
@@ -1561,6 +1750,9 @@ pub fn compare_ui(
                         trade.price
                     };
                     let position = Pos2::new(x_for(trade.time_ms), y_for(value));
+                    if !plot.contains(position) {
+                        continue;
+                    }
                     let distance = position.distance_sq(pointer);
                     if nearest
                         .as_ref()
@@ -1571,9 +1763,9 @@ pub fn compare_ui(
                 }
             }
             if let Some((_, market, trade, position, index)) = nearest {
-                painter.circle_stroke(position, 5.0, Stroke::new(1.5, TEXT));
+                plot_painter.circle_stroke(position, 5.0, Stroke::new(1.5, TEXT));
                 let color = trade_color(trade.side, SERIES_COLORS[index % SERIES_COLORS.len()]);
-                painter.circle_filled(position, 2.5, color);
+                plot_painter.circle_filled(position, 2.5, color);
                 painter
                     .with_clip_rect(Rect::from_min_max(
                         Pos2::new(plot.left(), rect.top()),
@@ -1598,13 +1790,54 @@ pub fn compare_ui(
             }
         }
     }
+    if let Some((index, account, order, y)) = hovered_order {
+        let market = &markets[*index];
+        let color = trade_color(order.side, MUTED);
+        painter.line_segment(
+            [Pos2::new(plot.left(), *y), Pos2::new(plot.right(), *y)],
+            Stroke::new(1.4, color),
+        );
+        painter
+            .with_clip_rect(Rect::from_min_max(
+                Pos2::new(plot.left(), rect.top()),
+                Pos2::new(plot.right(), plot.top()),
+            ))
+            .text(
+                Pos2::new(plot.left() + 3.0, rect.top() + 7.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "ORDER {} · {} {} {} · {} × {} · …{}",
+                    trade_side_label(order.side),
+                    venue_code(market.exchange),
+                    market.kind.label(),
+                    market.symbol,
+                    order.price,
+                    order.size,
+                    &account.address[account.address.len().saturating_sub(4)..],
+                ),
+                FontId::monospace(9.0),
+                color,
+            );
+    }
+}
+
+fn order_plot_value(price: &str, base: f64, percent: bool) -> Option<f64> {
+    let price = price.parse::<f64>().ok()?;
+    if !price.is_finite() || price <= 0.0 || !base.is_finite() || base <= 0.0 {
+        return None;
+    }
+    Some(if percent {
+        (price / base - 1.0) * 100.0
+    } else {
+        price
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        book_scroll_bounds, execution_metrics, own_orders_at, quote_size_text, simplify_points,
-        trade_utc,
+        YAxisView, book_scroll_bounds, execution_metrics, order_plot_value, own_orders_at,
+        quote_size_text, simplify_points, trade_utc,
     };
     use terminal_core::{Account, Exchange, Level, OwnOrder, TradeSide};
 
@@ -1636,6 +1869,38 @@ mod tests {
             own_orders_at(&[(&account, &order)], &level, TradeSide::Sell),
             0
         );
+    }
+
+    #[test]
+    fn own_order_uses_source_baseline_in_percent_comparison() {
+        assert!((order_plot_value("105", 100.0, true).unwrap() - 5.0).abs() < 1e-10);
+        assert_eq!(order_plot_value("105", 100.0, false), Some(105.0));
+        assert_eq!(order_plot_value("0", 100.0, true), None);
+    }
+
+    #[test]
+    fn vertical_pan_reveals_lower_orders_and_keeps_manual_bounds() {
+        let mut view = YAxisView::default();
+        view.pan((90.0, 110.0), -100.0, 200.0);
+        assert_eq!(view.manual, Some((80.0, 100.0)));
+        assert!((80.0..=100.0).contains(&85.0));
+        // A live repaint or a horizontal-only drag must not alter the manual range.
+        view.pan((95.0, 115.0), 0.0, 200.0);
+        assert_eq!(view.manual, Some((80.0, 100.0)));
+    }
+
+    #[test]
+    fn vertical_zoom_keeps_pointer_price_fixed_and_can_reveal_distant_orders() {
+        let mut view = YAxisView::default();
+        view.zoom((90.0, 110.0), -300.0, 0.25);
+        let (floor, ceiling) = view.manual.unwrap();
+        assert!((floor + 0.25 * (ceiling - floor) - 95.0).abs() < 1e-10);
+        assert!((floor..=ceiling).contains(&80.0));
+        assert!(ceiling - floor > 20.0);
+        view.zoom((floor, ceiling), 300.0, 0.25);
+        let (floor, ceiling) = view.manual.unwrap();
+        assert!((floor - 90.0).abs() < 1e-10);
+        assert!((ceiling - 110.0).abs() < 1e-10);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 A real-time crypto market-data terminal built in Rust. The interface runs in the browser through WebAssembly; a Rust server connects to exchange feeds and keeps the order books in sync. No JavaScript framework.
 
-Connect a Hyperliquid wallet address from the account button beside **Add widget** to see live open orders and perpetual positions. CHART marks orders and position entries; BOOK highlights own orders at levels present in Hyperliquid's depth feed. The account menu lists all open orders, including those beyond the book feed's 20 levels. This is read-only: no signing or API key is needed. Multiple wallet addresses can be saved locally in the browser. Hyperliquid limits live user subscriptions to 10 distinct addresses.
+Connect a Hyperliquid wallet address from the account button beside **Add widget** to see live open orders and perpetual positions. CHART marks orders and position entries; BOOK highlights own orders at levels present in Hyperliquid's depth feed. PRICES marks open orders for its selected sources; its config can hide them per widget. The account menu lists all open orders, including those beyond the book feed's 20 levels. Use the eye beside an account to hide its widget overlays without disconnecting it. This is read-only: no signing or API key is needed. Multiple wallet addresses can be saved locally in the browser. Hyperliquid limits live user subscriptions to 10 distinct addresses.
 
 ![Terminal with charts, price comparison, order books, and trades tape](docs/screenshots/overview.jpg)
 
@@ -12,6 +12,8 @@ Connect a Hyperliquid wallet address from the account button beside **Add widget
 - **Four widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, and trades tape.
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
+
+Drag CHART or PRICES vertically to move the price range. Scroll over the right price scale to zoom it, or use Shift + scroll over CHART; PRICES also supports scrolling over the plot. Double-click the price scale to restore automatic scaling.
 
 <img src="docs/screenshots/market-selection.jpg" alt="Per-widget exchange, market type, and symbol selection" width="520">
 

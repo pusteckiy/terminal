@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 use terminal_core::{
     Account, AccountState, BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange,
-    LastPrice, Level, Market, MarketKind, ServerMessage, SymbolInfo, Trade, TradeSide,
+    LastPrice, Level, Market, MarketKind, OwnOrder, ServerMessage, SymbolInfo, Trade, TradeSide,
 };
 
 // Dark neutral surfaces and control states follow the shadcn/ui color roles.
@@ -35,6 +35,10 @@ const TAB_DELETE_HOVER_SECS: f64 = 0.45;
 
 const fn default_compare_window_secs() -> u32 {
     60
+}
+
+const fn default_compare_show_orders() -> bool {
+    true
 }
 
 fn terminal_visuals() -> egui::Visuals {
@@ -74,6 +78,51 @@ fn terminal_visuals() -> egui::Visuals {
     visuals.selection.bg_fill = HOVER;
     visuals.selection.stroke = egui::Stroke::new(1.0, TEXT);
     visuals
+}
+
+fn account_visibility_button(ui: &mut egui::Ui, visible: bool) -> bool {
+    let response = ui.add_sized(
+        [23.0, 21.0],
+        egui::Button::new("")
+            .fill(RAISED)
+            .stroke(egui::Stroke::new(1.0, BORDER)),
+    );
+    let center = response.rect.center();
+    let color = if visible { TEXT } else { MUTED };
+    ui.painter().add(egui::epaint::PathShape::line(
+        [
+            (-6.0, 0.0),
+            (-3.0, -2.8),
+            (0.0, -3.8),
+            (3.0, -2.8),
+            (6.0, 0.0),
+            (3.0, 2.8),
+            (0.0, 3.8),
+            (-3.0, 2.8),
+            (-6.0, 0.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| center + egui::vec2(x, y))
+        .collect(),
+        egui::Stroke::new(1.2, color),
+    ));
+    ui.painter()
+        .circle_stroke(center, 1.7, egui::Stroke::new(1.2, color));
+    if !visible {
+        let from = center + egui::vec2(-6.0, 5.0);
+        let to = center + egui::vec2(6.0, -5.0);
+        ui.painter()
+            .line_segment([from, to], egui::Stroke::new(3.0, RAISED));
+        ui.painter()
+            .line_segment([from, to], egui::Stroke::new(1.2, color));
+    }
+    response
+        .on_hover_text(if visible {
+            "Hide account on widgets"
+        } else {
+            "Show account on widgets"
+        })
+        .clicked()
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -119,8 +168,11 @@ struct Pane {
     compare_percent: bool,
     compare_mode: CompareMode,
     compare_window_secs: u32,
+    compare_show_orders: bool,
     #[serde(skip)]
     chart: view::ChartView,
+    #[serde(skip)]
+    compare_view: view::YAxisView,
     #[serde(skip)]
     book_view: view::BookView,
     #[serde(skip)]
@@ -148,7 +200,9 @@ impl Pane {
             compare_percent: false,
             compare_mode: CompareMode::default(),
             compare_window_secs: default_compare_window_secs(),
+            compare_show_orders: default_compare_show_orders(),
             chart: view::ChartView::default(),
+            compare_view: view::YAxisView::default(),
             book_view: view::BookView::default(),
             legacy: false,
             search: String::new(),
@@ -174,6 +228,8 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_mode: CompareMode,
                 #[serde(default = "default_compare_window_secs")]
                 compare_window_secs: u32,
+                #[serde(default = "default_compare_show_orders")]
+                compare_show_orders: bool,
             },
             Legacy(WidgetKind),
         }
@@ -185,6 +241,7 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_percent,
                 compare_mode,
                 compare_window_secs,
+                compare_show_orders,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -193,6 +250,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.compare_percent = compare_percent;
                 pane.compare_mode = compare_mode;
                 pane.compare_window_secs = compare_window_secs.clamp(10, 600);
+                pane.compare_show_orders = compare_show_orders;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -424,6 +482,7 @@ struct TerminalApp {
     catalog_requests: HashSet<(Exchange, MarketKind)>,
     subscribed: HashSet<Market>,
     accounts: Vec<Account>,
+    hidden_widget_accounts: HashSet<Account>,
     account_data: HashMap<Account, AccountState>,
     subscribed_accounts: HashSet<Account>,
     account_exchange: Exchange,
@@ -496,6 +555,11 @@ impl TerminalApp {
                 .into_iter()
                 .filter(Account::valid)
                 .collect(),
+            hidden_widget_accounts: cc
+                .storage
+                .and_then(|storage| storage.get_string("hidden_widget_accounts"))
+                .and_then(|saved| serde_json::from_str(&saved).ok())
+                .unwrap_or_default(),
             account_data: HashMap::new(),
             subscribed_accounts: HashSet::new(),
             account_exchange: Exchange::Hyperliquid,
@@ -1015,6 +1079,14 @@ impl TerminalApp {
                             &account.address[account.address.len() - 4..]
                         ))
                         .on_hover_text(&account.address);
+                        let visible = !self.hidden_widget_accounts.contains(account);
+                        if account_visibility_button(ui, visible) {
+                            if visible {
+                                self.hidden_widget_accounts.insert(account.clone());
+                            } else {
+                                self.hidden_widget_accounts.remove(account);
+                            }
+                        }
                         if ui
                             .small_button("×")
                             .on_hover_text("Remove account")
@@ -1088,7 +1160,8 @@ impl TerminalApp {
                     }
                 }
                 if let Some(index) = remove {
-                    self.accounts.remove(index);
+                    let account = self.accounts.remove(index);
+                    self.hidden_widget_accounts.remove(&account);
                 }
                 ui.separator();
                 ui.label(
@@ -1133,6 +1206,7 @@ impl TerminalApp {
                     } else if self.accounts.contains(&account) {
                         self.account_error = Some("This account is already connected".into());
                     } else {
+                        self.hidden_widget_accounts.remove(&account);
                         self.accounts.push(account);
                         self.account_address.clear();
                         self.account_error = None;
@@ -1296,6 +1370,8 @@ fn compare_editor(
     if pane.compare_mode == CompareMode::Trades {
         ui.checkbox(&mut pane.compare_percent, "Compare % change");
     }
+    ui.checkbox(&mut pane.compare_show_orders, "Show account orders")
+        .on_hover_text("Show open orders from visible accounts on this Prices widget");
     ui.label(
         RichText::new("ROLLING WINDOW · SECONDS")
             .small()
@@ -1489,9 +1565,38 @@ fn market_editor(
     }
 }
 
+fn visible_account_states<'a>(
+    market: &'a Market,
+    states: &'a HashMap<Account, AccountState>,
+    hidden: &'a HashSet<Account>,
+) -> impl Iterator<Item = (&'a Account, &'a AccountState)> + 'a {
+    states.iter().filter(move |(account, state)| {
+        account.exchange == market.exchange && state.connected && !hidden.contains(*account)
+    })
+}
+
+fn visible_source_orders<'a>(
+    sources: &'a [Market],
+    states: &'a HashMap<Account, AccountState>,
+    hidden: &'a HashSet<Account>,
+) -> Vec<(usize, &'a Account, &'a OwnOrder)> {
+    let mut orders = Vec::new();
+    for (index, market) in sources.iter().enumerate() {
+        for (account, state) in visible_account_states(market, states, hidden) {
+            for order in &state.orders {
+                if order.coin == market.symbol {
+                    orders.push((index, account, order));
+                }
+            }
+        }
+    }
+    orders
+}
+
 struct PaneBehavior<'a> {
     data: &'a HashMap<Market, MarketData>,
     account_data: &'a HashMap<Account, AccountState>,
+    hidden_widget_accounts: &'a HashSet<Account>,
     catalogs: &'a HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     catalog_errors: &'a HashMap<(Exchange, MarketKind), String>,
     needed_catalogs: &'a mut HashSet<(Exchange, MarketKind)>,
@@ -1507,6 +1612,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             *self.focused = Some(tile_id);
         }
         let old_market = pane.market.clone();
+        let old_compare = (pane.series.clone(), pane.compare_mode, pane.compare_percent);
         let live = if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
             !pane.series.is_empty()
                 && pane
@@ -1605,30 +1711,32 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             pane.chart = view::ChartView::default();
             pane.book_view = view::BookView::default();
         }
+        if old_compare.0 != pane.series
+            || old_compare.1 != pane.compare_mode
+            || old_compare.2 != pane.compare_percent
+        {
+            pane.compare_view = view::YAxisView::default();
+        }
         ui.separator();
         let data = self.data.get(&pane.market);
         let market = &pane.market;
-        let own_orders: Vec<_> = self
-            .account_data
-            .iter()
-            .filter(|(account, state)| account.exchange == market.exchange && state.connected)
-            .flat_map(|(account, state)| {
-                state.orders.iter().filter_map(move |order| {
-                    (order.coin == market.symbol).then_some((account, order))
+        let own_orders: Vec<_> =
+            visible_account_states(market, self.account_data, self.hidden_widget_accounts)
+                .flat_map(|(account, state)| {
+                    state.orders.iter().filter_map(move |order| {
+                        (order.coin == market.symbol).then_some((account, order))
+                    })
                 })
-            })
-            .collect();
-        let positions: Vec<_> = self
-            .account_data
-            .iter()
-            .filter(|(account, state)| account.exchange == market.exchange && state.connected)
-            .flat_map(|(account, state)| {
-                state.positions.iter().filter_map(move |position| {
-                    (market.kind == MarketKind::Perp && position.coin == market.symbol)
-                        .then_some((account, position))
+                .collect();
+        let positions: Vec<_> =
+            visible_account_states(market, self.account_data, self.hidden_widget_accounts)
+                .flat_map(|(account, state)| {
+                    state.positions.iter().filter_map(move |position| {
+                        (market.kind == MarketKind::Perp && position.coin == market.symbol)
+                            .then_some((account, position))
+                    })
                 })
-            })
-            .collect();
+                .collect();
         match pane.kind {
             WidgetKind::Chart => {
                 let candles = data.map_or(&[][..], |data| data.candles.as_slice());
@@ -1640,14 +1748,27 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 &mut pane.book_view,
                 &own_orders,
             ),
-            WidgetKind::Compare => view::compare_ui(
-                ui,
-                &pane.series,
-                self.data,
-                pane.compare_mode,
-                pane.compare_percent,
-                pane.compare_window_secs,
-            ),
+            WidgetKind::Compare => {
+                let orders = if pane.compare_show_orders {
+                    visible_source_orders(
+                        &pane.series,
+                        self.account_data,
+                        self.hidden_widget_accounts,
+                    )
+                } else {
+                    Vec::new()
+                };
+                view::compare_ui(
+                    ui,
+                    &pane.series,
+                    self.data,
+                    pane.compare_mode,
+                    pane.compare_percent,
+                    pane.compare_window_secs,
+                    &orders,
+                    &mut pane.compare_view,
+                );
+            }
             WidgetKind::Tape => view::tape_ui(ui, &pane.series, self.data),
         }
         if dragging {
@@ -1711,6 +1832,7 @@ impl eframe::App for TerminalApp {
                 let mut behavior = PaneBehavior {
                     data: &self.data,
                     account_data: &self.account_data,
+                    hidden_widget_accounts: &self.hidden_widget_accounts,
                     catalogs: &self.catalogs,
                     catalog_errors: &self.catalog_errors,
                     needed_catalogs: &mut needed_catalogs,
@@ -1738,6 +1860,9 @@ impl eframe::App for TerminalApp {
         }
         if let Ok(accounts) = serde_json::to_string(&self.accounts) {
             storage.set_string("accounts", accounts);
+        }
+        if let Ok(hidden) = serde_json::to_string(&self.hidden_widget_accounts) {
+            storage.set_string("hidden_widget_accounts", hidden);
         }
     }
 }
@@ -1820,6 +1945,7 @@ mod tests {
             catalog_requests: HashSet::new(),
             subscribed: HashSet::new(),
             accounts: Vec::new(),
+            hidden_widget_accounts: HashSet::new(),
             account_data: HashMap::new(),
             subscribed_accounts: HashSet::new(),
             account_exchange: Exchange::Hyperliquid,
@@ -1831,6 +1957,63 @@ mod tests {
             receiver: None,
             reconnect_at: 0.0,
         }
+    }
+
+    #[test]
+    fn hidden_account_stays_connected_but_is_excluded_from_widget_data() {
+        let market = Market::for_exchange(Exchange::Hyperliquid);
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x0000000000000000000000000000000000000000".into(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            account.clone(),
+            AccountState {
+                connected: true,
+                ..Default::default()
+            },
+        );
+        let mut hidden = HashSet::new();
+        assert_eq!(visible_account_states(&market, &states, &hidden).count(), 1);
+        hidden.insert(account.clone());
+        assert_eq!(visible_account_states(&market, &states, &hidden).count(), 0);
+        assert!(states.get(&account).unwrap().connected);
+    }
+
+    #[test]
+    fn prices_orders_match_each_source_and_account_visibility() {
+        let hyper = Market::for_exchange(Exchange::Hyperliquid);
+        let other_symbol = Market {
+            symbol: "ETH".into(),
+            ..hyper.clone()
+        };
+        let binance = Market::for_exchange(Exchange::Binance);
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x0000000000000000000000000000000000000000".into(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            account.clone(),
+            AccountState {
+                connected: true,
+                orders: vec![OwnOrder {
+                    coin: hyper.symbol.clone(),
+                    order_id: 7,
+                    side: TradeSide::Buy,
+                    price: "100".into(),
+                    size: "1".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        let sources = [binance, other_symbol, hyper];
+        let hidden = HashSet::new();
+        let orders = visible_source_orders(&sources, &states, &hidden);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].0, 2);
+        assert!(visible_source_orders(&sources, &states, &HashSet::from([account])).is_empty());
     }
 
     #[test]
@@ -1981,6 +2164,11 @@ mod tests {
         let pane: Pane = serde_json::from_str(saved).unwrap();
         assert_eq!(pane.compare_mode, CompareMode::Trades);
         assert_eq!(pane.compare_window_secs, 60);
+        assert!(pane.compare_show_orders);
+        let mut pane = pane;
+        pane.compare_show_orders = false;
+        let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert!(!restored.compare_show_orders);
     }
 
     #[test]
