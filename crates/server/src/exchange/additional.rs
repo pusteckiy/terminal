@@ -66,6 +66,7 @@ fn parse_catalog(
                 symbol: symbol.clone(),
                 base: base.into(),
                 quote: quote.into(),
+                base_token_id: None,
                 market_id: None,
                 size_multiplier: None,
                 price_step: text(&row["tick_size"]),
@@ -134,6 +135,7 @@ fn parse_catalog(
                     base.into()
                 },
                 quote: quote.into(),
+                base_token_id: None,
                 market_id: None,
                 size_multiplier: multiplier,
                 price_step: step,

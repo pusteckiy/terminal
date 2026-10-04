@@ -168,11 +168,20 @@ impl AppState {
         }
     }
 
-    async fn publish_fills(&self, account: &Account, fills: Vec<OwnFill>, snapshot: bool) {
+    async fn publish_fills(
+        &self,
+        account: &Account,
+        fills: Vec<OwnFill>,
+        snapshot: bool,
+    ) -> Vec<OwnFill> {
         let mut histories = self.account_fills.write().await;
         let history = histories.entry(account.clone()).or_default();
         let added = terminal_core::merge_account_fills(history, fills);
-        let fills = if snapshot { history.clone() } else { added };
+        let fills = if snapshot {
+            history.clone()
+        } else {
+            added.clone()
+        };
         drop(histories);
         if snapshot || !fills.is_empty() {
             let _ = self.updates.send(ServerMessage::AccountFills {
@@ -181,6 +190,7 @@ impl AppState {
                 snapshot,
             });
         }
+        if snapshot { Vec::new() } else { added }
     }
 
     async fn acquire(&self, market: Market) {
@@ -522,7 +532,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             },
             event = updates.recv(), if !selected.is_empty() || !selected_accounts.is_empty() => match event {
                 Ok(event) if event.market().is_some_and(|market| selected.contains(market))
-                    || matches!(&event, ServerMessage::AccountState { account, .. } | ServerMessage::AccountFills { account, .. } if selected_accounts.contains(account)) => {
+                    || matches!(&event, ServerMessage::AccountState { account, .. } | ServerMessage::AccountFills { account, .. } | ServerMessage::AccountPosition { account, .. } if selected_accounts.contains(account)) => {
                     if send(&mut socket, &event).await.is_err() {
                         break 'connection;
                     }
@@ -626,23 +636,35 @@ mod tests {
             side: TradeSide::Buy,
             price: "100".into(),
             size: "0.2".into(),
+            start_position: None,
             taker: false,
             fee: "0".into(),
             fee_token: "USDC".into(),
         };
         let mut events = state.updates.subscribe();
-        state
+        let added = state
             .publish_fills(&account, vec![fill.clone()], false)
             .await;
+        assert_eq!(added, vec![fill.clone()]);
         assert!(
             matches!(events.recv().await.unwrap(), ServerMessage::AccountFills { fills, snapshot: false, .. } if fills.len() == 1)
         );
-        state
+        let added = state
             .publish_fills(&account, vec![fill.clone()], false)
             .await;
+        assert!(added.is_empty());
         assert!(events.try_recv().is_err());
         assert!(
-            matches!(state.fills_snapshot(&account).await, ServerMessage::AccountFills { fills, snapshot: true, .. } if fills == vec![fill])
+            matches!(state.fills_snapshot(&account).await, ServerMessage::AccountFills { fills, snapshot: true, .. } if fills == vec![fill.clone()])
+        );
+        let mut history_fill = fill.clone();
+        history_fill.trade_id = 3;
+        assert!(
+            state
+                .publish_fills(&account, vec![history_fill], true)
+                .await
+                .is_empty(),
+            "historical snapshots must never update live size"
         );
     }
 

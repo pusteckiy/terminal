@@ -1,6 +1,7 @@
 mod dom;
 mod fills;
 mod orderflow;
+mod position;
 mod view;
 
 use std::{
@@ -151,6 +152,7 @@ enum WidgetKind {
     Tape,
     Dom,
     Fills,
+    Position,
 }
 
 impl WidgetKind {
@@ -162,6 +164,7 @@ impl WidgetKind {
             Self::Tape => "Trade Tape",
             Self::Dom => "DOM",
             Self::Fills => "Fills",
+            Self::Position => "Position",
         }
     }
 
@@ -173,6 +176,7 @@ impl WidgetKind {
             Self::Tape => "TRADES",
             Self::Dom => "DOM",
             Self::Fills => "FILLS",
+            Self::Position => "POSITION",
         }
     }
 }
@@ -196,6 +200,9 @@ struct Pane {
     orderflow: orderflow::Settings,
     dom: dom::Settings,
     fills: fills::Settings,
+    position: position::Settings,
+    #[serde(skip)]
+    position_view: position::View,
     #[serde(skip)]
     fills_view: fills::View,
     #[serde(skip)]
@@ -216,6 +223,12 @@ struct Pane {
 
 impl Pane {
     fn new(kind: WidgetKind, market: Market) -> Self {
+        let market =
+            if matches!(kind, WidgetKind::Position) && market.exchange != Exchange::Hyperliquid {
+                Market::for_exchange(Exchange::Hyperliquid)
+            } else {
+                market
+            };
         let series = if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) {
             vec![
                 Market::for_exchange(Exchange::Binance),
@@ -235,6 +248,8 @@ impl Pane {
             orderflow: orderflow::Settings::default(),
             dom: dom::Settings::default(),
             fills: fills::Settings::default(),
+            position: position::Settings::default(),
+            position_view: position::View::default(),
             fills_view: fills::View::default(),
             dom_view: dom::View::default(),
             chart: view::ChartView::default(),
@@ -272,6 +287,8 @@ impl<'de> Deserialize<'de> for Pane {
                 dom: dom::Settings,
                 #[serde(default)]
                 fills: fills::Settings,
+                #[serde(default)]
+                position: position::Settings,
             },
             Legacy(WidgetKind),
         }
@@ -287,6 +304,7 @@ impl<'de> Deserialize<'de> for Pane {
                 orderflow,
                 dom,
                 fills,
+                position,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -299,6 +317,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.orderflow = orderflow;
                 pane.dom = dom;
                 pane.fills = fills;
+                pane.position = position;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -703,9 +722,28 @@ impl TerminalApp {
                         &self.hidden_widget_accounts,
                         utc_now_ms(),
                     ));
+                } else if matches!(pane.kind, WidgetKind::Position) {
+                    if pane.market.kind == MarketKind::Spot
+                        && pane.position.metric == position::Metric::Notional
+                    {
+                        wanted.insert(pane.market.clone());
+                    }
                 } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
                     wanted.extend(pane.series.iter().cloned());
                 } else {
+                    wanted.insert(pane.market.clone());
+                }
+            }
+        }
+        // POSITION history keeps recording across terminal switches. Spot
+        // notional therefore keeps its price source while that widget exists.
+        for tree in &self.workspaces {
+            for (_, tile) in tree.tiles.iter() {
+                if let Tile::Pane(pane) = tile
+                    && matches!(pane.kind, WidgetKind::Position)
+                    && pane.market.kind == MarketKind::Spot
+                    && pane.position.metric == position::Metric::Notional
+                {
                     wanted.insert(pane.market.clone());
                 }
             }
@@ -766,6 +804,27 @@ impl TerminalApp {
         }
     }
 
+    fn record_positions(&mut self, changed_market: Option<&Market>) {
+        let now = utc_now_ms();
+        for tree in &mut self.workspaces {
+            for (_, tile) in tree.tiles.iter_mut() {
+                if let Tile::Pane(pane) = tile
+                    && matches!(pane.kind, WidgetKind::Position)
+                    && changed_market.is_none_or(|market| market == &pane.market)
+                {
+                    pane.position_view.observe(
+                        &pane.market,
+                        &self.accounts,
+                        &self.account_data,
+                        orderflow::symbol_info(&pane.market, &self.catalogs),
+                        self.data.get(&pane.market),
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
     fn poll_socket(&mut self, ctx: &egui::Context) {
         while let Some(event) = self.receiver.as_ref().and_then(WsReceiver::try_recv) {
             match event {
@@ -790,6 +849,7 @@ impl TerminalApp {
                                 self.catalogs.insert(key, symbols);
                                 self.catalog_requests.remove(&key);
                             }
+                            self.record_positions(None);
                             continue;
                         }
                         if let ServerMessage::AccountFills { account, fills, .. } = message {
@@ -798,9 +858,28 @@ impl TerminalApp {
                             }
                             continue;
                         }
+                        if let ServerMessage::AccountPosition { account, position } = message {
+                            if self.subscribed_accounts.contains(&account) {
+                                let market = Market {
+                                    exchange: account.exchange,
+                                    kind: MarketKind::Perp,
+                                    symbol: position.coin.clone(),
+                                };
+                                if self
+                                    .account_data
+                                    .entry(account)
+                                    .or_default()
+                                    .apply_live_position(position)
+                                {
+                                    self.record_positions(Some(&market));
+                                }
+                            }
+                            continue;
+                        }
                         if let ServerMessage::AccountState { account, state } = message {
                             if self.subscribed_accounts.contains(&account) {
                                 self.account_data.insert(account, state);
+                                self.record_positions(None);
                             }
                             continue;
                         }
@@ -811,7 +890,7 @@ impl TerminalApp {
                             continue;
                         }
                         let exchange = market.exchange;
-                        let data = self.data.entry(market).or_default();
+                        let data = self.data.entry(market.clone()).or_default();
                         match message {
                             ServerMessage::Snapshot {
                                 candles,
@@ -884,8 +963,10 @@ impl TerminalApp {
                             }
                             ServerMessage::Symbols { .. } => {}
                             ServerMessage::AccountState { .. }
-                            | ServerMessage::AccountFills { .. } => {}
+                            | ServerMessage::AccountFills { .. }
+                            | ServerMessage::AccountPosition { .. } => {}
                         }
+                        self.record_positions(Some(&market));
                     }
                 }
                 WsEvent::Closed | WsEvent::Error(_) => {
@@ -899,6 +980,7 @@ impl TerminalApp {
                         data.best_bid_ask = None;
                         data.fill_quotes = fills::QuoteHistory::default();
                     }
+                    self.record_positions(None);
                     self.sender = None;
                     self.receiver = None;
                     self.reconnect_at = ctx.input(|input| input.time) + 3.0;
@@ -1075,6 +1157,7 @@ impl TerminalApp {
                                 WidgetKind::Tape,
                                 WidgetKind::Dom,
                                 WidgetKind::Fills,
+                                WidgetKind::Position,
                             ] {
                                 if ui.button(kind.label()).clicked() {
                                     add = Some(kind);
@@ -1700,7 +1783,20 @@ impl Behavior<Pane> for PaneBehavior<'_> {
         }
         let old_market = pane.market.clone();
         let old_compare = (pane.series.clone(), pane.compare_mode, pane.compare_percent);
-        let live = if matches!(pane.kind, WidgetKind::Fills) {
+        let live = if matches!(pane.kind, WidgetKind::Position) {
+            position::is_live(
+                &pane.position,
+                &pane.market,
+                self.accounts,
+                self.hidden_widget_accounts,
+                self.account_data,
+            ) && (pane.market.kind != MarketKind::Spot
+                || pane.position.metric != position::Metric::Notional
+                || self
+                    .data
+                    .get(&pane.market)
+                    .is_some_and(|data| data.connected && data.best_bid_ask.is_some()))
+        } else if matches!(pane.kind, WidgetKind::Fills) {
             self.accounts.iter().any(|account| {
                 !self.hidden_widget_accounts.contains(account)
                     && self
@@ -1733,6 +1829,13 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
                 let subtitle = if matches!(pane.kind, WidgetKind::Fills) {
                     "Hyperliquid".to_owned()
+                } else if matches!(pane.kind, WidgetKind::Position)
+                    && pane.market.kind == MarketKind::Spot
+                {
+                    orderflow::symbol_info(&pane.market, self.catalogs).map_or_else(
+                        || format!("Hyperliquid Spot {}", pane.market.symbol),
+                        |info| format!("Hyperliquid Spot {}/{}", info.base, info.quote),
+                    )
                 } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
                     format!("{} sources", pane.series.len())
                 } else {
@@ -1780,6 +1883,20 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                         self.catalogs,
                                         self.catalog_errors,
                                         self.needed_catalogs,
+                                        self.retry_catalogs,
+                                    );
+                                }
+                                WidgetKind::Position => {
+                                    position::config_ui(
+                                        ui,
+                                        &mut pane.position,
+                                        &mut pane.market,
+                                        &mut pane.search,
+                                        self.accounts,
+                                        self.hidden_widget_accounts,
+                                        self.account_data,
+                                        self.catalogs,
+                                        self.catalog_errors,
                                         self.retry_catalogs,
                                     );
                                 }
@@ -1832,6 +1949,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             pane.chart = view::ChartView::default();
             pane.book_view = view::BookView::default();
             pane.dom_view = dom::View::default();
+            pane.position_view = position::View::default();
         }
         if old_compare.0 != pane.series
             || old_compare.1 != pane.compare_mode
@@ -1901,6 +2019,23 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Tape => view::tape_ui(ui, &pane.series, self.data),
+            WidgetKind::Position => {
+                self.needed_catalogs
+                    .insert((pane.market.exchange, pane.market.kind));
+                position::ui(
+                    ui,
+                    market,
+                    &pane.position,
+                    &mut pane.position_view,
+                    self.accounts,
+                    self.hidden_widget_accounts,
+                    self.account_data,
+                    data,
+                    orderflow::symbol_info(market, self.catalogs),
+                    self.fills,
+                );
+            }
+
             WidgetKind::Fills => {
                 for kind in MarketKind::ALL {
                     self.needed_catalogs.insert((Exchange::Hyperliquid, kind));

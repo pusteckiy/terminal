@@ -334,6 +334,13 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
                 },
                 base: base.to_owned(),
                 quote: quote.to_owned(),
+                base_token_id: if exchange == Exchange::Hyperliquid && kind == MarketKind::Spot {
+                    row["tokens"][0]
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                } else {
+                    None
+                },
                 market_id,
                 size_multiplier,
                 price_step: if exchange == Exchange::Bitunix && kind == MarketKind::Spot {
@@ -474,6 +481,7 @@ mod tests {
         let hyperliquid = json!({"tokens":[{"index":0,"name":"USDC"},{"index":1,"name":"PURR"}],"universe":[{"name":"PURR/USDC","tokens":[1,0]}]});
         let symbol = &parse(Exchange::Hyperliquid, MarketKind::Spot, &hyperliquid).unwrap()[0];
         assert_eq!((&*symbol.base, &*symbol.quote), ("PURR", "USDC"));
+        assert_eq!(symbol.base_token_id, Some(1));
 
         let gate = json!([{"name":"BTC_USDT","status":"trading","type":"direct","quanto_multiplier":"0.0001"}]);
         assert_eq!(

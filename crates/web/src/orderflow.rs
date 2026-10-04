@@ -270,6 +270,7 @@ mod tests {
                     symbol: market.symbol.clone(),
                     base: "BTC".into(),
                     quote: quote.into(),
+                    base_token_id: None,
                     market_id: None,
                     size_multiplier: None,
                     price_step: None,

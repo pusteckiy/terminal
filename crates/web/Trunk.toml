@@ -1,0 +1,10 @@
+# Chromium ignores SRI on fetch preloads. Keep the JS module's integrity hash
+# and remove only the unsupported attribute from Trunk's generated WASM link.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", '''
+set -eu
+sed 's/\(<link rel="preload"[^>]*\) integrity="[^"]*"\([^>]* as="fetch"[^>]* type="application\/wasm"[^>]*>\)/\1\2/g' "$TRUNK_STAGING_DIR/index.html" > "$TRUNK_STAGING_DIR/index.html.tmp"
+mv "$TRUNK_STAGING_DIR/index.html.tmp" "$TRUNK_STAGING_DIR/index.html"
+''']

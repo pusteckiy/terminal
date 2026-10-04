@@ -224,7 +224,7 @@ impl YAxisView {
         }
     }
 
-    fn interact(
+    pub(super) fn interact(
         &mut self,
         ui: &mut egui::Ui,
         response: &egui::Response,
@@ -275,7 +275,7 @@ impl YAxisView {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 response
                     .clone()
-                    .on_hover_text("Drag to move price · Scroll to zoom · Double-click to reset");
+                    .on_hover_text("Drag to move range · Scroll to zoom · Double-click to reset");
                 if response.double_clicked() {
                     self.manual = None;
                 }
@@ -1230,7 +1230,7 @@ fn book_inspector(
     );
 }
 
-const SERIES_COLORS: [Color32; 6] = [
+pub(super) const SERIES_COLORS: [Color32; 6] = [
     Color32::from_rgb(94, 193, 255),
     Color32::from_rgb(255, 190, 94),
     Color32::from_rgb(171, 147, 255),

@@ -202,6 +202,8 @@ pub struct SymbolInfo {
     pub base: String,
     pub quote: String,
     #[serde(default)]
+    pub base_token_id: Option<u32>,
+    #[serde(default)]
     pub market_id: Option<u32>,
     #[serde(default)]
     pub size_multiplier: Option<String>,
@@ -307,6 +309,16 @@ pub struct Position {
     pub size: String,
     pub entry_price: String,
     pub unrealized_pnl: String,
+    #[serde(default)]
+    pub notional_value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpotBalance {
+    pub coin: String,
+    pub token: u32,
+    pub total: String,
+    pub hold: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,9 +330,18 @@ pub struct OwnFill {
     pub side: TradeSide,
     pub price: String,
     pub size: String,
+    #[serde(default)]
+    pub start_position: Option<String>,
     pub taker: bool,
     pub fee: String,
     pub fee_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LivePosition {
+    pub coin: String,
+    pub size: String,
+    pub time_ms: i64,
 }
 
 impl OwnFill {
@@ -361,9 +382,45 @@ pub fn merge_account_fills(history: &mut Vec<OwnFill>, fills: Vec<OwnFill>) -> V
 pub struct AccountState {
     pub orders: Vec<OwnOrder>,
     pub positions: Vec<Position>,
+    #[serde(default)]
+    pub positions_updated_at_ms: i64,
+    #[serde(default)]
+    pub position_snapshot_times: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub live_positions: Vec<LivePosition>,
+    #[serde(default)]
+    pub spot_balances: Vec<SpotBalance>,
+    #[serde(default)]
+    pub spot_updated_at_ms: i64,
     pub connected: bool,
     pub updated_at_ms: i64,
     pub error: Option<String>,
+}
+
+impl AccountState {
+    pub fn position_snapshot_time(&self, coin: &str) -> i64 {
+        let dex = coin.split_once(':').map_or("", |(dex, _)| dex);
+        self.position_snapshot_times.get(dex).copied().unwrap_or(0)
+    }
+
+    pub fn apply_live_position(&mut self, position: LivePosition) -> bool {
+        if position.time_ms <= self.position_snapshot_time(&position.coin) {
+            return false;
+        }
+        if let Some(previous) = self
+            .live_positions
+            .iter_mut()
+            .find(|p| p.coin == position.coin)
+        {
+            if previous.time_ms > position.time_ms || *previous == position {
+                return false;
+            }
+            *previous = position;
+        } else {
+            self.live_positions.push(position);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -390,6 +447,10 @@ pub enum ClientMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AccountPosition {
+        account: Account,
+        position: LivePosition,
+    },
     AccountFills {
         account: Account,
         fills: Vec<OwnFill>,
@@ -458,7 +519,9 @@ impl ServerMessage {
             | Self::Trades { market, .. }
             | Self::Status { market, .. } => Some(market),
             Self::Symbols { .. } => None,
-            Self::AccountState { .. } | Self::AccountFills { .. } => None,
+            Self::AccountState { .. }
+            | Self::AccountFills { .. }
+            | Self::AccountPosition { .. } => None,
         }
     }
 }
@@ -477,6 +540,7 @@ mod tests {
             side: TradeSide::Buy,
             price: "100".into(),
             size: "0.2".into(),
+            start_position: None,
             taker: false,
             fee: "0".into(),
             fee_token: "USDC".into(),

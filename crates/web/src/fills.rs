@@ -497,7 +497,7 @@ fn outcome_text(outcome: Outcome, units: Units) -> (String, Color32) {
     }
 }
 
-fn utc(ms: i64) -> String {
+pub(super) fn utc(ms: i64) -> String {
     let seconds = ms.div_euclid(1_000).rem_euclid(86_400);
     format!(
         "{:02}:{:02}:{:02}.{:03}",
@@ -803,6 +803,7 @@ mod tests {
             side,
             price: "100".into(),
             size: "0.2".into(),
+            start_position: None,
             taker: false,
             fee: "-0.001".into(),
             fee_token: "USDC".into(),
