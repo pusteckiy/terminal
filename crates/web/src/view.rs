@@ -1237,6 +1237,15 @@ const SERIES_COLORS: [Color32; 6] = [
     Color32::from_rgb(255, 137, 198),
 ];
 
+fn trade_dot_radius(trade: &TradePoint) -> f32 {
+    let quote_size = trade.price * trade.size;
+    if !quote_size.is_finite() || quote_size <= 0.0 {
+        return 1.6;
+    }
+    // A stable logarithmic scale keeps small fills visible and caps large fills.
+    (1.6 + (quote_size / 100.0).ln_1p() * 0.8).clamp(1.6, 6.0) as f32
+}
+
 // Keep the first, last, high, and low observation in each horizontal pixel bucket.
 // Long windows remain cheap to draw without hiding brief price moves.
 fn simplify_points(
@@ -1687,43 +1696,36 @@ pub fn compare_ui(
                 };
                 Pos2::new(x_for(trade.time_ms), y_for(price))
             };
+            let draw_trade = |trade: &TradePoint| {
+                plot_painter.circle_filled(
+                    position(trade),
+                    trade_dot_radius(trade),
+                    trade_color(trade.side, fallback),
+                );
+            };
             let visible_count = 1 + trades.clone().count();
             if visible_count <= plot.width() as usize * 2 {
                 for trade in std::iter::once(first).chain(trades) {
-                    plot_painter.circle_filled(
-                        position(trade),
-                        1.8,
-                        trade_color(trade.side, fallback),
-                    );
+                    draw_trade(trade);
                 }
             } else {
-                // One dot per horizontal pixel keeps dense tape streams responsive.
+                // Keep the largest fill per horizontal pixel in dense tape streams.
                 let mut pending = first;
                 let mut column = position(first).x as i32;
                 for trade in trades {
                     let next_column = position(trade).x as i32;
                     if next_column != column {
-                        plot_painter.circle_filled(
-                            position(pending),
-                            1.8,
-                            trade_color(pending.side, fallback),
-                        );
+                        draw_trade(pending);
                         column = next_column;
+                        pending = trade;
+                    } else if trade.price * trade.size >= pending.price * pending.size {
+                        pending = trade;
                     }
-                    pending = trade;
                 }
-                plot_painter.circle_filled(
-                    position(pending),
-                    1.8,
-                    trade_color(pending.side, fallback),
-                );
+                draw_trade(pending);
             }
             if let Some(latest) = market_data.price_trades.back() {
-                plot_painter.circle_filled(
-                    position(latest),
-                    2.8,
-                    trade_color(latest.side, fallback),
-                );
+                draw_trade(latest);
             }
         }
     }
@@ -1771,9 +1773,10 @@ pub fn compare_ui(
                 }
             }
             if let Some((_, market, trade, position, index)) = nearest {
-                plot_painter.circle_stroke(position, 5.0, Stroke::new(1.5, TEXT));
+                let radius = trade_dot_radius(trade);
+                plot_painter.circle_stroke(position, radius + 2.0, Stroke::new(1.5, TEXT));
                 let color = trade_color(trade.side, SERIES_COLORS[index % SERIES_COLORS.len()]);
-                plot_painter.circle_filled(position, 2.5, color);
+                plot_painter.circle_filled(position, radius, color);
                 painter
                     .with_clip_rect(Rect::from_min_max(
                         Pos2::new(plot.left(), rect.top()),
