@@ -6,7 +6,8 @@ license.workspace = true
 
 [dependencies]
 terminal-core = { path = "../core" }
-serde_json.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
@@ -14,4 +15,3 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal = "1"
 tower-http = { version = "0.6", features = ["fs"] }
-

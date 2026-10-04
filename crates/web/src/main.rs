@@ -338,7 +338,7 @@ impl MarketData {
     fn set_book(&mut self, book: Book, exchange: Exchange) {
         if !matches!(
             exchange,
-            Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter
+            Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter | Exchange::Pacifica
         ) && let (Some(bid), Some(ask)) = (book.bids.first(), book.asks.first())
             && self
                 .best_bid_ask
@@ -377,7 +377,7 @@ impl MarketData {
         };
         if !matches!(
             exchange,
-            Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter
+            Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter | Exchange::Pacifica
         ) && let Some(quote) = quote
             && self
                 .best_bid_ask

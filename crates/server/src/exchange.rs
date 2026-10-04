@@ -17,6 +17,8 @@ use tokio_tungstenite::{
 
 use crate::AppState;
 
+pub(crate) mod additional;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 fn now_ms() -> i64 {
@@ -69,7 +71,9 @@ fn decimal(value: &Value) -> Option<Decimal> {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string());
-    Decimal::from_str(&text).ok()
+    Decimal::from_str(&text)
+        .or_else(|_| Decimal::from_scientific(&text))
+        .ok()
 }
 
 fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
@@ -216,6 +220,7 @@ fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
                             _ => TradeSide::Unknown,
                         }
                     }
+                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
                 },
             })
         })
@@ -277,7 +282,7 @@ fn quote_from_values(bid: &Value, ask: &Value, time: &Value) -> Option<BestBidAs
     })
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BookAccumulator {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
@@ -772,6 +777,9 @@ async fn run_binance_perp_trades(market: &Market, state: &AppState) {
 }
 
 async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
+    if additional::handles(market.exchange) {
+        return additional::stream(market, state).await;
+    }
     let symbol = market.symbol.as_str();
     let multiplier = base_size_multiplier(market, state).await?;
     let lighter_id = if market.exchange == Exchange::Lighter {
@@ -827,6 +835,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
         Exchange::Lighter => "wss://mainnet.zklighter.elliot.ai/stream".to_owned(),
         Exchange::Bitget => "wss://ws.bitget.com/v2/ws/public".to_owned(),
         Exchange::Bitunix => "wss://fapi.bitunix.com/public/".to_owned(),
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     };
     let mut request = url.into_client_request()?;
     if market.exchange == Exchange::Gate && market.kind == MarketKind::Perp {
@@ -902,6 +911,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
             {"symbol":symbol,"ch":"depth_books"},
             {"symbol":symbol,"ch":"trade"}
         ]})],
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     };
     for subscription in subscriptions {
         socket
@@ -996,6 +1006,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                         integer(&value["data"][0]["ts"]).or_else(|| integer(&value["ts"]))
                     }
                     Exchange::Bitunix => integer(&value["ts"]),
+                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
                 }
                 .unwrap_or_else(now_ms);
                 let mut delta_rows: Option<(&Value, &Value)> = None;
@@ -1138,6 +1149,7 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                             false
                         }
                     }
+                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
                 };
                 if ready {
                     if book.is_crossed() {
@@ -1201,6 +1213,9 @@ async fn fetch_candles(
     state: &AppState,
     client: &reqwest::Client,
 ) -> Result<Vec<Candle>, Error> {
+    if additional::handles(market.exchange) {
+        return additional::candles(market, state).await;
+    }
     let symbol = market.symbol.as_str();
     let multiplier = base_size_multiplier(market, state)
         .await?
@@ -1377,6 +1392,7 @@ async fn fetch_candles(
                 .json()
                 .await?
         }
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     };
     let rows = match market.exchange {
         Exchange::Binance | Exchange::Aster | Exchange::Hyperliquid => &value,
@@ -1385,6 +1401,7 @@ async fn fetch_candles(
         Exchange::Gate => &value,
         Exchange::Lighter => &value["c"],
         Exchange::Bitget | Exchange::Bitunix => &value["data"],
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     };
     let mut candles = rows
         .as_array()

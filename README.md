@@ -8,7 +8,7 @@ Connect a Hyperliquid wallet address from the account button beside **Add widget
 
 ## What it does
 
-- **Nine exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, Lighter, Bitget, Aster, and Bitunix. Choose Spot or Perp and a symbol separately for each widget.
+- **Twelve exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, Lighter, Bitget, Aster, Bitunix, KuCoin, Kraken, and Pacifica. Choose Spot or Perp and a symbol separately for each widget.
 - **Four widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, and trades tape.
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
@@ -32,7 +32,9 @@ Open **http://127.0.0.1:3000**. Run `cargo test --workspace` to check the projec
 
 ## Scope
 
-Perp support covers linear contracts: Binance USDⓈ-M, OKX linear swaps, Bybit linear, Gate USDT, Hyperliquid, Lighter, Bitget USDT, Aster, and Bitunix USDT. Inverse contracts are not included. Binance and Aster Perp publish aggregate trade events, so their tapes show each published aggregate rather than every underlying execution. Bitunix Spot currently provides a polled public order book and candle history; its public API does not expose a trade stream, so its trade tape and Last Trades comparison are unavailable. Order books contain the price levels available from each exchange's public feed; they do not expose individual orders. The terminal displays public market data and does not place trades.
+Perp support covers linear contracts: Binance USDⓈ-M, OKX linear swaps, Bybit linear, Gate USDT, Hyperliquid, Lighter, Bitget USDT, Aster, Bitunix USDT, KuCoin linear, Kraken `PF_*`, and Pacifica. Inverse contracts are not included. Binance and Aster Perp publish aggregate trade events, so their tapes show each published aggregate rather than every underlying execution. Bitunix Spot currently provides a polled public order book and candle history; its public API does not expose a trade stream, so its trade tape and Last Trades comparison are unavailable. Order books contain the price levels available from each exchange's public feed; they do not expose individual orders. The terminal displays public market data and does not place trades.
+
+KuCoin uses its public UTA feed with 500 levels per side and up to 10 ms book updates. Kraken Spot provides 1,000 levels with checksum validation; its linear Perp feed supplies a snapshot and sequenced updates. Pacifica supports both Spot and Perp, with a dedicated event-driven BBO feed for PRICES. See [API notes](docs/exchanges/kucoin-kraken-pacifica.md) for source documentation and depth limits.
 
 ## Project
 

@@ -2928,6 +2928,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "rust_decimal",
+ "serde",
  "serde_json",
  "terminal-core",
  "tokio",

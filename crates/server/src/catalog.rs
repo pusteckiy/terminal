@@ -9,6 +9,9 @@ pub async fn fetch(
     kind: MarketKind,
     client: &Client,
 ) -> Result<Vec<SymbolInfo>, Error> {
+    if crate::exchange::additional::handles(exchange) {
+        return crate::exchange::additional::catalog(exchange, kind, client).await;
+    }
     let response: Value = match exchange {
         Exchange::Binance => {
             client
@@ -129,6 +132,7 @@ pub async fn fetch(
                 .json()
                 .await?
         }
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     };
     let mut symbols = parse(exchange, kind, &response)?;
     if exchange == Exchange::Bybit && kind == MarketKind::Perp {
@@ -172,6 +176,7 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
         Exchange::Lighter => &response["order_books"],
         Exchange::Bitget | Exchange::Bitunix => &response["data"],
         Exchange::Aster => &response["symbols"],
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
     }
     .as_array()
     .ok_or_else(|| std::io::Error::other("invalid symbol catalog response"))?;
@@ -319,6 +324,7 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
                     None,
                     None,
                 ),
+                Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
             };
             enabled.then(|| SymbolInfo {
                 symbol: if exchange == Exchange::Bitunix && kind == MarketKind::Spot {

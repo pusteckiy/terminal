@@ -42,6 +42,9 @@ fn venue_code(exchange: Exchange) -> &'static str {
         Exchange::Bitget => "BGT",
         Exchange::Aster => "AST",
         Exchange::Bitunix => "BUX",
+        Exchange::Kucoin => "KUC",
+        Exchange::Kraken => "KRK",
+        Exchange::Pacifica => "PAC",
     }
 }
 
@@ -183,6 +186,12 @@ pub struct ChartView {
     offset: usize,
     drag_remainder: f32,
     y_axis: YAxisView,
+}
+
+impl ChartView {
+    fn clamp_offset(&mut self, candle_count: usize) {
+        self.offset = self.offset.min(candle_count.saturating_sub(self.visible));
+    }
 }
 
 #[derive(Default)]
@@ -433,7 +442,7 @@ pub fn chart_ui(
             view.visible = (view.visible as isize + change).clamp(20, 220) as usize;
         }
     }
-    view.offset = view.offset.min(candles.len().saturating_sub(1));
+    view.clamp_offset(candles.len());
     let step = plot.width() / view.visible as f32;
     if response.dragged_by(egui::PointerButton::Primary)
         && ui.input(|input| {
@@ -446,9 +455,8 @@ pub fn chart_ui(
         view.drag_remainder += ui.input(|input| input.pointer.delta().x);
         let moved = (view.drag_remainder / step).trunc() as isize;
         if moved != 0 {
-            view.offset = (view.offset as isize + moved)
-                .clamp(0, candles.len().saturating_sub(1) as isize)
-                as usize;
+            view.offset = view.offset.saturating_add_signed(moved);
+            view.clamp_offset(candles.len());
             view.drag_remainder -= moved as f32 * step;
         }
     } else {
@@ -1836,10 +1844,34 @@ fn order_plot_value(price: &str, base: f64, percent: bool) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        YAxisView, book_scroll_bounds, execution_metrics, order_plot_value, own_orders_at,
-        quote_size_text, simplify_points, trade_utc,
+        ChartView, YAxisView, book_scroll_bounds, execution_metrics, order_plot_value,
+        own_orders_at, quote_size_text, simplify_points, trade_utc,
     };
     use terminal_core::{Account, Exchange, Level, OwnOrder, TradeSide};
+
+    #[test]
+    fn chart_history_boundary_keeps_a_full_visible_window() {
+        let mut view = ChartView {
+            visible: 90,
+            offset: 299,
+            ..Default::default()
+        };
+        view.clamp_offset(300);
+        assert_eq!(view.offset, 210);
+        assert_eq!((300 - view.offset).min(view.visible), 90);
+        // Further dragging at the history limit cannot remove candles from the other edge.
+        view.offset += 50;
+        view.clamp_offset(300);
+        assert_eq!(view.offset, 210);
+        // Zooming out at that boundary must also keep the wider window filled.
+        view.visible = 220;
+        view.clamp_offset(300);
+        assert_eq!(view.offset, 80);
+        view.clamp_offset(40);
+        assert_eq!(view.offset, 0);
+        view.clamp_offset(0);
+        assert_eq!(view.offset, 0);
+    }
 
     #[test]
     fn own_book_marker_matches_exact_price_and_side() {

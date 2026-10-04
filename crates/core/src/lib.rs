@@ -13,10 +13,13 @@ pub enum Exchange {
     Bitget,
     Aster,
     Bitunix,
+    Kucoin,
+    Kraken,
+    Pacifica,
 }
 
 impl Exchange {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::Binance,
         Self::Okx,
         Self::Bybit,
@@ -26,6 +29,9 @@ impl Exchange {
         Self::Bitget,
         Self::Aster,
         Self::Bitunix,
+        Self::Kucoin,
+        Self::Kraken,
+        Self::Pacifica,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -39,6 +45,9 @@ impl Exchange {
             Self::Bitget => "Bitget",
             Self::Aster => "Aster",
             Self::Bitunix => "Bitunix",
+            Self::Kucoin => "KuCoin",
+            Self::Kraken => "Kraken",
+            Self::Pacifica => "Pacifica",
         }
     }
 
@@ -54,6 +63,12 @@ impl Exchange {
             (Self::Gate, _) => "BTC_USDT",
             (Self::Lighter, MarketKind::Spot) => "ETH/USDC",
             (Self::Lighter, MarketKind::Perp) => "BTC",
+            (Self::Kucoin, MarketKind::Spot) => "BTC-USDT",
+            (Self::Kucoin, MarketKind::Perp) => "XBTUSDTM",
+            (Self::Kraken, MarketKind::Spot) => "BTC/USD",
+            (Self::Kraken, MarketKind::Perp) => "PF_XBTUSD",
+            (Self::Pacifica, MarketKind::Spot) => "SOL-USDC",
+            (Self::Pacifica, MarketKind::Perp) => "BTC",
         }
     }
 }
@@ -101,7 +116,9 @@ impl Default for Market {
 impl Market {
     pub fn for_exchange(exchange: Exchange) -> Self {
         let kind = match exchange {
-            Exchange::Hyperliquid | Exchange::Lighter | Exchange::Bitunix => MarketKind::Perp,
+            Exchange::Hyperliquid | Exchange::Lighter | Exchange::Bitunix | Exchange::Pacifica => {
+                MarketKind::Perp
+            }
             _ => MarketKind::Spot,
         };
         Self::for_exchange_kind(exchange, kind)
@@ -152,6 +169,12 @@ impl<'de> Deserialize<'de> for Market {
                 (Exchange::Hyperliquid, true) => "ETH",
                 (Exchange::Gate, true) => "ETH_USDT",
                 (Exchange::Lighter, true) => "ETH",
+                (Exchange::Kucoin, true) if kind == MarketKind::Perp => "ETHUSDTM",
+                (Exchange::Kucoin, true) => "ETH-USDT",
+                (Exchange::Kraken, true) if kind == MarketKind::Perp => "PF_ETHUSD",
+                (Exchange::Kraken, true) => "ETH/USD",
+                (Exchange::Pacifica, true) if kind == MarketKind::Spot => "SOL-USDC",
+                (Exchange::Pacifica, true) => "ETH",
                 (exchange, false) => exchange.default_symbol(kind),
             }
             .to_owned()
@@ -390,6 +413,23 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_messages_decode_decimal_candles() {
+        let snapshot = r#"{"type":"snapshot","market":{"exchange":"okx","kind":"spot","symbol":"SOL-USDT"},"candles":[{"time":1791105720,"open":121.01,"high":121.05,"low":121.0,"close":121.04,"volume":146.030352}],"book":null,"best_bid_ask":null,"last_price":null,"connected":true}"#;
+        let message = serde_json::from_str::<ServerMessage>(snapshot).unwrap();
+        let ServerMessage::Snapshot { candles, .. } = message else {
+            panic!("expected candle history");
+        };
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].close, 121.04);
+        let update = r#"{"type":"candle","market":{"exchange":"okx","kind":"spot","symbol":"SOL-USDT"},"candle":{"time":1791123660,"open":121.3,"high":121.31,"low":121.25,"close":121.25,"volume":241.663733}}"#;
+        let message = serde_json::from_str::<ServerMessage>(update).unwrap();
+        let ServerMessage::Candle { candle, .. } = message else {
+            panic!("expected live candle");
+        };
+        assert_eq!(candle.close, 121.25);
+    }
 
     #[test]
     fn hyperliquid_account_requires_wallet_address() {
