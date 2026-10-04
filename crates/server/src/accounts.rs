@@ -5,7 +5,9 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use terminal_core::{Account, AccountState, OwnOrder, Position, TradeSide};
+use terminal_core::{
+    Account, AccountState, Exchange, Market, MarketKind, OwnFill, OwnOrder, Position, TradeSide,
+};
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -78,10 +80,61 @@ fn subscription(kind: &str, account: &Account, method: &str) -> Message {
     Message::Text(
         json!({
             "method": method,
-            "subscription": {"type": kind, "user": account.address}
+            "subscription": if kind == "userFills" {
+                json!({"type": kind, "user": account.address, "aggregateByTime": false})
+            } else {
+                json!({"type": kind, "user": account.address})
+            }
         })
         .to_string()
         .into(),
+    )
+}
+
+fn parse_fills(data: &Value) -> Option<Vec<OwnFill>> {
+    Some(
+        data["fills"]
+            .as_array()?
+            .iter()
+            .filter_map(|row| {
+                let coin = field(row, "coin")?;
+                let kind = if coin.starts_with('@') || coin.contains('/') {
+                    MarketKind::Spot
+                } else {
+                    MarketKind::Perp
+                };
+                let price = field(row, "px")?;
+                let size = field(row, "sz")?;
+                if [price.as_str(), size.as_str()].iter().any(|value| {
+                    value
+                        .parse::<rust_decimal::Decimal>()
+                        .ok()
+                        .is_none_or(|value| value <= rust_decimal::Decimal::ZERO)
+                }) {
+                    return None;
+                }
+                Some(OwnFill {
+                    market: Market {
+                        exchange: Exchange::Hyperliquid,
+                        kind,
+                        symbol: coin,
+                    },
+                    time_ms: row["time"].as_i64()?,
+                    trade_id: row["tid"].as_u64()?,
+                    order_id: row["oid"].as_u64()?,
+                    side: match row["side"].as_str()? {
+                        "B" => TradeSide::Buy,
+                        "A" => TradeSide::Sell,
+                        _ => return None,
+                    },
+                    price,
+                    size,
+                    taker: row["crossed"].as_bool()?,
+                    fee: field(row, "fee").unwrap_or_default(),
+                    fee_token: field(row, "feeToken").unwrap_or_default(),
+                })
+            })
+            .collect(),
     )
 }
 
@@ -129,7 +182,7 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                 .cloned()
                 .collect();
             for account in subscribed.difference(&desired) {
-                for kind in ["openOrders", "clearinghouseState"] {
+                for kind in ["openOrders", "clearinghouseState", "userFills"] {
                     if socket
                         .send(subscription(kind, account, "unsubscribe"))
                         .await
@@ -142,7 +195,7 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
             }
             for account in desired.difference(&subscribed) {
                 clear(&state, account, None).await;
-                for kind in ["openOrders", "clearinghouseState"] {
+                for kind in ["openOrders", "clearinghouseState", "userFills"] {
                     if socket
                         .send(subscription(kind, account, "subscribe"))
                         .await
@@ -193,10 +246,16 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                     let Message::Text(text) = frame else { continue; };
                     let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
                     let channel = value["channel"].as_str().unwrap_or_default();
-                    if channel != "openOrders" && channel != "clearinghouseState" { continue; }
+                    if channel != "openOrders" && channel != "clearinghouseState" && channel != "userFills" { continue; }
                     let data = &value["data"];
                     let Some(user) = data["user"].as_str() else { continue; };
                     let Some(account) = subscribed.iter().find(|account| account.address.eq_ignore_ascii_case(user)) else { continue; };
+                    if channel == "userFills" {
+                        if let Some(fills) = parse_fills(data) {
+                            state.publish_fills(account, fills, data["isSnapshot"] == true).await;
+                        }
+                        continue;
+                    }
                     let Some(flags) = received.get_mut(account) else { continue; };
                     let mut current = state.accounts.read().await.get(account).cloned().unwrap_or_default();
                     if channel == "openOrders" {
@@ -230,6 +289,37 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_individual_fills_and_preserves_side_fees_and_market_kind() {
+        let value = json!({"fills":[
+            {"coin":"BTC","px":"100.2","sz":"0.01","side":"B","time":1000,"tid":1,"oid":2,"crossed":false,"fee":"-0.001","feeToken":"USDC"},
+            {"coin":"@107","px":"100.3","sz":"0.02","side":"A","time":1001,"tid":3,"oid":4,"crossed":true,"fee":"0.002","feeToken":"UBTC"},
+            {"coin":"BTC","px":"NaN","sz":"0.01","side":"B","time":1000,"tid":5,"oid":6,"crossed":false}
+        ]});
+        let fills = parse_fills(&value).unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].market.kind, MarketKind::Perp);
+        assert_eq!(fills[0].side, TradeSide::Buy);
+        assert!(!fills[0].taker);
+        assert_eq!(fills[0].fee, "-0.001");
+        assert_eq!(fills[1].market.kind, MarketKind::Spot);
+        assert_eq!(fills[1].market.symbol, "@107");
+        assert_eq!(fills[1].side, TradeSide::Sell);
+        assert!(fills[1].taker);
+        let Message::Text(subscription) = subscription(
+            "userFills",
+            &Account {
+                exchange: Exchange::Hyperliquid,
+                address: "0x1234".into(),
+            },
+            "subscribe",
+        ) else {
+            panic!()
+        };
+        let value: Value = serde_json::from_str(&subscription).unwrap();
+        assert_eq!(value["subscription"]["aggregateByTime"], false);
+    }
 
     #[test]
     fn parses_current_orders_and_positions() {

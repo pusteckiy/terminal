@@ -20,7 +20,7 @@ use axum::{
 };
 use terminal_core::{
     Account, AccountState, BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange,
-    LastPrice, Market, MarketKind, ServerMessage, SymbolInfo, Trade,
+    LastPrice, Market, MarketKind, OwnFill, ServerMessage, SymbolInfo, Trade,
 };
 use tokio::{
     sync::{Mutex, RwLock, broadcast, mpsc, watch},
@@ -101,6 +101,7 @@ struct AppState {
     http: reqwest::Client,
     updates: broadcast::Sender<ServerMessage>,
     accounts: Arc<RwLock<HashMap<Account, AccountState>>>,
+    account_fills: Arc<RwLock<HashMap<Account, Vec<OwnFill>>>>,
     account_users: Arc<Mutex<HashMap<Account, usize>>>,
     account_control: watch::Sender<Vec<Account>>,
 }
@@ -121,6 +122,7 @@ impl AppState {
             if *count == 0 {
                 users.remove(account);
                 self.accounts.write().await.remove(account);
+                self.account_fills.write().await.remove(account);
             }
         }
         let mut accounts: Vec<_> = users.keys().cloned().collect();
@@ -150,6 +152,35 @@ impl AppState {
             account: account.clone(),
             state,
         });
+    }
+
+    async fn fills_snapshot(&self, account: &Account) -> ServerMessage {
+        ServerMessage::AccountFills {
+            account: account.clone(),
+            fills: self
+                .account_fills
+                .read()
+                .await
+                .get(account)
+                .cloned()
+                .unwrap_or_default(),
+            snapshot: true,
+        }
+    }
+
+    async fn publish_fills(&self, account: &Account, fills: Vec<OwnFill>, snapshot: bool) {
+        let mut histories = self.account_fills.write().await;
+        let history = histories.entry(account.clone()).or_default();
+        let added = terminal_core::merge_account_fills(history, fills);
+        let fills = if snapshot { history.clone() } else { added };
+        drop(histories);
+        if snapshot || !fills.is_empty() {
+            let _ = self.updates.send(ServerMessage::AccountFills {
+                account: account.clone(),
+                fills,
+                snapshot,
+            });
+        }
     }
 
     async fn acquire(&self, market: Market) {
@@ -444,6 +475,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 if send(&mut socket, &state.account_snapshot(&account).await).await.is_err() {
                                     break 'connection;
                                 }
+                                if send(&mut socket, &state.fills_snapshot(&account).await).await.is_err() {
+                                    break 'connection;
+                                }
                             }
                             ClientMessage::UnsubscribeAccount { account } => {
                                 if selected_accounts.remove(&account) {
@@ -488,7 +522,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             },
             event = updates.recv(), if !selected.is_empty() || !selected_accounts.is_empty() => match event {
                 Ok(event) if event.market().is_some_and(|market| selected.contains(market))
-                    || matches!(&event, ServerMessage::AccountState { account, .. } if selected_accounts.contains(account)) => {
+                    || matches!(&event, ServerMessage::AccountState { account, .. } | ServerMessage::AccountFills { account, .. } if selected_accounts.contains(account)) => {
                     if send(&mut socket, &event).await.is_err() {
                         break 'connection;
                     }
@@ -501,6 +535,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     }
                     for account in &selected_accounts {
                         if send(&mut socket, &state.account_snapshot(account).await).await.is_err() {
+                            break 'connection;
+                        }
+                        if send(&mut socket, &state.fills_snapshot(account).await).await.is_err() {
                             break 'connection;
                         }
                     }
@@ -532,6 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http,
         updates,
         accounts: Arc::default(),
+        account_fills: Arc::default(),
         account_users: Arc::default(),
         account_control,
     };
@@ -567,9 +605,45 @@ mod tests {
             http: reqwest::Client::new(),
             updates,
             accounts: Arc::default(),
+            account_fills: Arc::default(),
             account_users: Arc::default(),
             account_control,
         }
+    }
+
+    #[tokio::test]
+    async fn fill_fanout_sends_deltas_and_reconnect_snapshot_without_duplicates() {
+        let state = test_state();
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        let fill = OwnFill {
+            market: Market::for_exchange(Exchange::Hyperliquid),
+            time_ms: 1000,
+            trade_id: 1,
+            order_id: 2,
+            side: TradeSide::Buy,
+            price: "100".into(),
+            size: "0.2".into(),
+            taker: false,
+            fee: "0".into(),
+            fee_token: "USDC".into(),
+        };
+        let mut events = state.updates.subscribe();
+        state
+            .publish_fills(&account, vec![fill.clone()], false)
+            .await;
+        assert!(
+            matches!(events.recv().await.unwrap(), ServerMessage::AccountFills { fills, snapshot: false, .. } if fills.len() == 1)
+        );
+        state
+            .publish_fills(&account, vec![fill.clone()], false)
+            .await;
+        assert!(events.try_recv().is_err());
+        assert!(
+            matches!(state.fills_snapshot(&account).await, ServerMessage::AccountFills { fills, snapshot: true, .. } if fills == vec![fill])
+        );
     }
 
     #[tokio::test]

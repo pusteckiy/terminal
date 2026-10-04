@@ -309,6 +309,54 @@ pub struct Position {
     pub unrealized_pnl: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OwnFill {
+    pub market: Market,
+    pub time_ms: i64,
+    pub trade_id: u64,
+    pub order_id: u64,
+    pub side: TradeSide,
+    pub price: String,
+    pub size: String,
+    pub taker: bool,
+    pub fee: String,
+    pub fee_token: String,
+}
+
+impl OwnFill {
+    pub fn key(&self) -> (i64, &str, &str, u64, u64) {
+        (
+            self.time_ms,
+            self.market.kind.label(),
+            &self.market.symbol,
+            self.trade_id,
+            self.order_id,
+        )
+    }
+}
+
+pub const MAX_ACCOUNT_FILLS: usize = 1_000;
+
+// Snapshots, live batches, and reconnect replays use the same execution identity.
+// Keep individual fills (including partial fills), newest first, with bounded memory.
+pub fn merge_account_fills(history: &mut Vec<OwnFill>, fills: Vec<OwnFill>) -> Vec<OwnFill> {
+    let mut added = Vec::new();
+    for fill in fills {
+        let index = history.partition_point(|stored| stored.key() > fill.key());
+        if index >= MAX_ACCOUNT_FILLS
+            || history
+                .get(index)
+                .is_some_and(|stored| stored.key() == fill.key())
+        {
+            continue;
+        }
+        added.push(fill.clone());
+        history.insert(index, fill);
+        history.truncate(MAX_ACCOUNT_FILLS);
+    }
+    added
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountState {
     pub orders: Vec<OwnOrder>,
@@ -342,6 +390,11 @@ pub enum ClientMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AccountFills {
+        account: Account,
+        fills: Vec<OwnFill>,
+        snapshot: bool,
+    },
     AccountState {
         account: Account,
         state: AccountState,
@@ -405,7 +458,7 @@ impl ServerMessage {
             | Self::Trades { market, .. }
             | Self::Status { market, .. } => Some(market),
             Self::Symbols { .. } => None,
-            Self::AccountState { .. } => None,
+            Self::AccountState { .. } | Self::AccountFills { .. } => None,
         }
     }
 }
@@ -413,6 +466,41 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_fill_replay_is_bounded_sorted_and_keeps_partial_executions() {
+        let fill = OwnFill {
+            market: Market::for_exchange(Exchange::Hyperliquid),
+            time_ms: 1000,
+            trade_id: 1,
+            order_id: 2,
+            side: TradeSide::Buy,
+            price: "100".into(),
+            size: "0.2".into(),
+            taker: false,
+            fee: "0".into(),
+            fee_token: "USDC".into(),
+        };
+        let mut history = Vec::new();
+        assert_eq!(
+            merge_account_fills(&mut history, vec![fill.clone()]).len(),
+            1
+        );
+        assert!(merge_account_fills(&mut history, vec![fill.clone()]).is_empty());
+        let mut partial = fill.clone();
+        partial.trade_id = 3;
+        merge_account_fills(&mut history, vec![partial]);
+        assert_eq!(history.len(), 2);
+        for time in 1001..2200 {
+            let mut item = fill.clone();
+            item.time_ms = time;
+            merge_account_fills(&mut history, vec![item]);
+        }
+        assert_eq!(history.len(), MAX_ACCOUNT_FILLS);
+        assert_eq!(history[0].time_ms, 2199);
+        assert!(history.windows(2).all(|rows| rows[0].key() > rows[1].key()));
+        assert!(merge_account_fills(&mut history, vec![fill]).is_empty());
+    }
 
     #[test]
     fn chart_messages_decode_decimal_candles() {

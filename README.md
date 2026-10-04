@@ -9,13 +9,15 @@ Connect a Hyperliquid wallet address from the account button beside **Add Widget
 ## What it does
 
 - **Twelve exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, Lighter, Bitget, Aster, Bitunix, KuCoin, Kraken, and Pacifica. Choose Spot or Perp and a symbol separately for each widget.
-- **Five widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, trades tape, and DOM price ladder.
+- **Six widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, trades tape, DOM price ladder, and own fills.
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
 
 Enable **Show orderflow** in PRICES config for buy/sell quote volume grouped into UTC seconds. SELL bars extend above zero, BUY below. The current second updates with each trade event. Choose a source beneath the price chart; **All sources** is available when base assets and quote currencies match. Hover either plot for per-second buy/sell volumes and delta (`Buy − Sell`) in both base and quote units. Unknown trade sides are excluded from delta and reported separately in the tooltip. Volume is collected live for up to 600 seconds, independently of the price plot's point limit.
 
 **DOM** combines resting BID/ASK liquidity, executed SOLD/BOUGHT volume, and visible accounts' open ORDERS on one descending price ladder. Configure price grouping, a rolling trade window of 1–600 seconds, and base or quote sizes. Hover a level for both units. Scroll or drag to explore; double-click to recenter and follow the market. Executed volume is collected from live trades; unavailable book depth is marked `—`.
+
+**FILLS** streams individual Hyperliquid account executions, including partial fills, with maker/taker, fees, and base/quote size details on hover. Filter visible accounts and symbols in config. Enable **Show markout** for editable horizons from 100 ms to 600 seconds (defaults: 1, 5, 30 seconds), in bp or percent. Markout uses the same venue’s mid-price at each horizon, signed by fill side and gross of fees. Completed measurements are fixed. `…` means pending; `—` means no valid observed quote. Quotes older than two seconds, observations started after the horizon, and missing history are excluded. Click a fill to expand its measured-horizon graph. Fills survive reconnect replay without duplicates; the latest 1,000 executions per account are kept in memory.
 
 Drag CHART or PRICES vertically to move the price range. Scroll over the right price scale to zoom it, or use Shift + scroll over CHART; PRICES also supports scrolling over the plot. Double-click the price scale to restore automatic scaling.
 

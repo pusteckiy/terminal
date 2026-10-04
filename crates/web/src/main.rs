@@ -1,4 +1,5 @@
 mod dom;
+mod fills;
 mod orderflow;
 mod view;
 
@@ -41,6 +42,21 @@ const fn default_compare_window_secs() -> u32 {
 
 const fn default_compare_show_orders() -> bool {
     true
+}
+
+fn utc_now_ms() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.performance())
+            .map_or(0, |clock| (clock.time_origin() + clock.now()) as i64)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64)
+    }
 }
 
 fn terminal_visuals() -> egui::Visuals {
@@ -134,6 +150,7 @@ enum WidgetKind {
     Compare,
     Tape,
     Dom,
+    Fills,
 }
 
 impl WidgetKind {
@@ -144,6 +161,7 @@ impl WidgetKind {
             Self::Compare => "Live Price",
             Self::Tape => "Trade Tape",
             Self::Dom => "DOM",
+            Self::Fills => "Fills",
         }
     }
 
@@ -154,6 +172,7 @@ impl WidgetKind {
             Self::Compare => "PRICES",
             Self::Tape => "TRADES",
             Self::Dom => "DOM",
+            Self::Fills => "FILLS",
         }
     }
 }
@@ -176,6 +195,9 @@ struct Pane {
     compare_show_orders: bool,
     orderflow: orderflow::Settings,
     dom: dom::Settings,
+    fills: fills::Settings,
+    #[serde(skip)]
+    fills_view: fills::View,
     #[serde(skip)]
     dom_view: dom::View,
     #[serde(skip)]
@@ -212,6 +234,8 @@ impl Pane {
             compare_show_orders: default_compare_show_orders(),
             orderflow: orderflow::Settings::default(),
             dom: dom::Settings::default(),
+            fills: fills::Settings::default(),
+            fills_view: fills::View::default(),
             dom_view: dom::View::default(),
             chart: view::ChartView::default(),
             compare_view: view::YAxisView::default(),
@@ -246,6 +270,8 @@ impl<'de> Deserialize<'de> for Pane {
                 orderflow: orderflow::Settings,
                 #[serde(default)]
                 dom: dom::Settings,
+                #[serde(default)]
+                fills: fills::Settings,
             },
             Legacy(WidgetKind),
         }
@@ -260,6 +286,7 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_show_orders,
                 orderflow,
                 dom,
+                fills,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -271,6 +298,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.compare_show_orders = compare_show_orders;
                 pane.orderflow = orderflow;
                 pane.dom = dom;
+                pane.fills = fills;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -294,6 +322,7 @@ struct MarketData {
     dom: dom::History,
     trades: VecDeque<Trade>,
     quotes: VecDeque<QuoteTick>,
+    fill_quotes: fills::QuoteHistory,
     connected: bool,
 }
 
@@ -431,9 +460,10 @@ impl MarketData {
         let (Ok(bid), Ok(ask)) = (quote.bid.parse::<f64>(), quote.ask.parse::<f64>()) else {
             return;
         };
-        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= bid {
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask < bid {
             return;
         }
+        self.fill_quotes.push(quote.time_ms, bid, ask, utc_now_ms());
         let tick = QuoteTick {
             time_ms: quote.time_ms,
             bid,
@@ -516,6 +546,7 @@ struct TerminalApp {
     accounts: Vec<Account>,
     hidden_widget_accounts: HashSet<Account>,
     account_data: HashMap<Account, AccountState>,
+    fills: fills::Store,
     subscribed_accounts: HashSet<Account>,
     account_exchange: Exchange,
     account_address: String,
@@ -593,6 +624,7 @@ impl TerminalApp {
                 .and_then(|saved| serde_json::from_str(&saved).ok())
                 .unwrap_or_default(),
             account_data: HashMap::new(),
+            fills: fills::Store::default(),
             subscribed_accounts: HashSet::new(),
             account_exchange: Exchange::Hyperliquid,
             account_address: String::new(),
@@ -665,7 +697,13 @@ impl TerminalApp {
         let mut wanted = HashSet::<Market>::new();
         for (_, tile) in self.workspaces[self.active_workspace].tiles.iter() {
             if let Tile::Pane(pane) = tile {
-                if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+                if matches!(pane.kind, WidgetKind::Fills) {
+                    wanted.extend(self.fills.wanted_markets(
+                        &pane.fills,
+                        &self.hidden_widget_accounts,
+                        utc_now_ms(),
+                    ));
+                } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
                     wanted.extend(pane.series.iter().cloned());
                 } else {
                     wanted.insert(pane.market.clone());
@@ -695,6 +733,7 @@ impl TerminalApp {
                 account: account.clone(),
             });
             self.account_data.remove(&account);
+            self.fills.histories.remove(&account);
         }
         for account in wanted_accounts
             .difference(&self.subscribed_accounts)
@@ -750,6 +789,12 @@ impl TerminalApp {
                                 self.catalog_errors.remove(&key);
                                 self.catalogs.insert(key, symbols);
                                 self.catalog_requests.remove(&key);
+                            }
+                            continue;
+                        }
+                        if let ServerMessage::AccountFills { account, fills, .. } = message {
+                            if self.subscribed_accounts.contains(&account) {
+                                self.fills.push(account, fills);
                             }
                             continue;
                         }
@@ -834,10 +879,12 @@ impl TerminalApp {
                                 if !connected {
                                     data.book = None;
                                     data.best_bid_ask = None;
+                                    data.fill_quotes = fills::QuoteHistory::default();
                                 }
                             }
                             ServerMessage::Symbols { .. } => {}
-                            ServerMessage::AccountState { .. } => {}
+                            ServerMessage::AccountState { .. }
+                            | ServerMessage::AccountFills { .. } => {}
                         }
                     }
                 }
@@ -850,6 +897,7 @@ impl TerminalApp {
                         data.connected = false;
                         data.book = None;
                         data.best_bid_ask = None;
+                        data.fill_quotes = fills::QuoteHistory::default();
                     }
                     self.sender = None;
                     self.receiver = None;
@@ -1026,6 +1074,7 @@ impl TerminalApp {
                                 WidgetKind::Compare,
                                 WidgetKind::Tape,
                                 WidgetKind::Dom,
+                                WidgetKind::Fills,
                             ] {
                                 if ui.button(kind.label()).clicked() {
                                     add = Some(kind);
@@ -1630,6 +1679,8 @@ fn visible_source_orders<'a>(
 }
 
 struct PaneBehavior<'a> {
+    accounts: &'a [Account],
+    fills: &'a fills::Store,
     data: &'a HashMap<Market, MarketData>,
     account_data: &'a HashMap<Account, AccountState>,
     hidden_widget_accounts: &'a HashSet<Account>,
@@ -1649,7 +1700,15 @@ impl Behavior<Pane> for PaneBehavior<'_> {
         }
         let old_market = pane.market.clone();
         let old_compare = (pane.series.clone(), pane.compare_mode, pane.compare_percent);
-        let live = if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+        let live = if matches!(pane.kind, WidgetKind::Fills) {
+            self.accounts.iter().any(|account| {
+                !self.hidden_widget_accounts.contains(account)
+                    && self
+                        .account_data
+                        .get(account)
+                        .is_some_and(|state| state.connected)
+            })
+        } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
             !pane.series.is_empty()
                 && pane
                     .series
@@ -1672,7 +1731,9 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     )
                     .sense(Sense::drag()),
                 );
-                let subtitle = if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+                let subtitle = if matches!(pane.kind, WidgetKind::Fills) {
+                    "Hyperliquid".to_owned()
+                } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
                     format!("{} sources", pane.series.len())
                 } else {
                     format!(
@@ -1720,6 +1781,17 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                         self.catalog_errors,
                                         self.needed_catalogs,
                                         self.retry_catalogs,
+                                    );
+                                }
+                                WidgetKind::Fills => {
+                                    fills::config_ui(
+                                        ui,
+                                        &mut pane.fills,
+                                        &mut pane.fills_view,
+                                        self.accounts,
+                                        self.hidden_widget_accounts,
+                                        self.fills,
+                                        self.catalogs,
                                     );
                                 }
                                 WidgetKind::Dom => {
@@ -1829,6 +1901,21 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Tape => view::tape_ui(ui, &pane.series, self.data),
+            WidgetKind::Fills => {
+                for kind in MarketKind::ALL {
+                    self.needed_catalogs.insert((Exchange::Hyperliquid, kind));
+                }
+                fills::ui(
+                    ui,
+                    &pane.fills,
+                    &mut pane.fills_view,
+                    self.fills,
+                    self.accounts,
+                    self.hidden_widget_accounts,
+                    self.data,
+                    self.catalogs,
+                );
+            }
             WidgetKind::Dom => {
                 self.needed_catalogs.insert((market.exchange, market.kind));
                 dom::ui(
@@ -1849,7 +1936,9 @@ impl Behavior<Pane> for PaneBehavior<'_> {
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
-        if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+        if matches!(pane.kind, WidgetKind::Fills) {
+            "FILLS".into()
+        } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
             format!(
                 "{} · {} sources",
                 pane.kind.short_label(),
@@ -1900,6 +1989,8 @@ impl eframe::App for TerminalApp {
             let mut retry_catalogs = HashSet::new();
             {
                 let mut behavior = PaneBehavior {
+                    accounts: &self.accounts,
+                    fills: &self.fills,
                     data: &self.data,
                     account_data: &self.account_data,
                     hidden_widget_accounts: &self.hidden_widget_accounts,
@@ -2017,6 +2108,7 @@ mod tests {
             accounts: Vec::new(),
             hidden_widget_accounts: HashSet::new(),
             account_data: HashMap::new(),
+            fills: fills::Store::default(),
             subscribed_accounts: HashSet::new(),
             account_exchange: Exchange::Hyperliquid,
             account_address: String::new(),

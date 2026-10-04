@@ -372,21 +372,6 @@ fn anchor_bounds(
     (group(low, step).max(step), group(high, step).max(step))
 }
 
-fn utc_now_ms() -> i64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window()
-            .and_then(|window| window.performance())
-            .map_or(0, |clock| (clock.time_origin() + clock.now()) as i64)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as i64)
-    }
-}
-
 pub fn ui(
     ui: &mut egui::Ui,
     data: Option<&MarketData>,
@@ -421,7 +406,7 @@ pub fn ui(
         return;
     };
     let step = display_step(book, info, settings, reference);
-    let utc_ms = utc_now_ms();
+    let utc_ms = crate::utc_now_ms();
     if view.step != Some(step) || view.anchor.is_none() {
         view.step = Some(step);
         view.following = true;
