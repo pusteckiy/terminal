@@ -1,3 +1,4 @@
+mod dom;
 mod orderflow;
 mod view;
 
@@ -132,15 +133,17 @@ enum WidgetKind {
     Book,
     Compare,
     Tape,
+    Dom,
 }
 
 impl WidgetKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Chart => "OHLCV chart",
-            Self::Book => "Order book",
-            Self::Compare => "Price comparison",
-            Self::Tape => "Trades tape",
+            Self::Chart => "OHLCV",
+            Self::Book => "Order Book",
+            Self::Compare => "Live Price",
+            Self::Tape => "Trade Tape",
+            Self::Dom => "DOM",
         }
     }
 
@@ -150,6 +153,7 @@ impl WidgetKind {
             Self::Book => "BOOK",
             Self::Compare => "PRICES",
             Self::Tape => "TRADES",
+            Self::Dom => "DOM",
         }
     }
 }
@@ -171,6 +175,9 @@ struct Pane {
     compare_window_secs: u32,
     compare_show_orders: bool,
     orderflow: orderflow::Settings,
+    dom: dom::Settings,
+    #[serde(skip)]
+    dom_view: dom::View,
     #[serde(skip)]
     chart: view::ChartView,
     #[serde(skip)]
@@ -204,6 +211,8 @@ impl Pane {
             compare_window_secs: default_compare_window_secs(),
             compare_show_orders: default_compare_show_orders(),
             orderflow: orderflow::Settings::default(),
+            dom: dom::Settings::default(),
+            dom_view: dom::View::default(),
             chart: view::ChartView::default(),
             compare_view: view::YAxisView::default(),
             book_view: view::BookView::default(),
@@ -235,6 +244,8 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_show_orders: bool,
                 #[serde(default)]
                 orderflow: orderflow::Settings,
+                #[serde(default)]
+                dom: dom::Settings,
             },
             Legacy(WidgetKind),
         }
@@ -248,6 +259,7 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_window_secs,
                 compare_show_orders,
                 orderflow,
+                dom,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -258,6 +270,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.compare_window_secs = compare_window_secs.clamp(10, 600);
                 pane.compare_show_orders = compare_show_orders;
                 pane.orderflow = orderflow;
+                pane.dom = dom;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -278,6 +291,7 @@ struct MarketData {
     price_trades: VecDeque<TradePoint>,
     latest_trade: Option<TradePoint>,
     orderflow: orderflow::History,
+    dom: dom::History,
     trades: VecDeque<Trade>,
     quotes: VecDeque<QuoteTick>,
     connected: bool,
@@ -300,6 +314,7 @@ struct TradePoint {
 
 impl MarketData {
     fn push_trade(&mut self, trade: Trade) {
+        self.dom.push(&trade);
         self.set_price(LastPrice {
             price: trade.price.clone(),
             time_ms: trade.time_ms,
@@ -985,7 +1000,7 @@ impl TerminalApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
                     let button = egui::Button::new(
-                        RichText::new("Add widget").strong().size(12.0).color(BG),
+                        RichText::new("Add Widget").strong().size(12.0).color(BG),
                     )
                     .fill(TEXT)
                     .stroke(egui::Stroke::new(1.0, TEXT))
@@ -1010,6 +1025,7 @@ impl TerminalApp {
                                 WidgetKind::Book,
                                 WidgetKind::Compare,
                                 WidgetKind::Tape,
+                                WidgetKind::Dom,
                             ] {
                                 if ui.button(kind.label()).clicked() {
                                     add = Some(kind);
@@ -1706,6 +1722,19 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                         self.retry_catalogs,
                                     );
                                 }
+                                WidgetKind::Dom => {
+                                    dom::config_ui(ui, &mut pane.dom);
+                                    ui.separator();
+                                    market_editor(
+                                        ui,
+                                        &mut pane.market,
+                                        &mut pane.search,
+                                        self.catalogs,
+                                        self.catalog_errors,
+                                        self.needed_catalogs,
+                                        self.retry_catalogs,
+                                    );
+                                }
                                 WidgetKind::Chart | WidgetKind::Book => market_editor(
                                     ui,
                                     &mut pane.market,
@@ -1730,6 +1759,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
         if old_market != pane.market {
             pane.chart = view::ChartView::default();
             pane.book_view = view::BookView::default();
+            pane.dom_view = dom::View::default();
         }
         if old_compare.0 != pane.series
             || old_compare.1 != pane.compare_mode
@@ -1799,6 +1829,17 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Tape => view::tape_ui(ui, &pane.series, self.data),
+            WidgetKind::Dom => {
+                self.needed_catalogs.insert((market.exchange, market.kind));
+                dom::ui(
+                    ui,
+                    data,
+                    orderflow::symbol_info(market, self.catalogs),
+                    &pane.dom,
+                    &mut pane.dom_view,
+                    &own_orders,
+                );
+            }
         }
         if dragging {
             UiResponse::DragStarted

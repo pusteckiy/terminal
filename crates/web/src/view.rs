@@ -333,7 +333,7 @@ fn spread_percent_text(bid: f64, ask: f64) -> Option<String> {
     }
 }
 
-fn quote_size_text(value: &str) -> String {
+pub(crate) fn quote_size_text(value: &str) -> String {
     let Ok(amount) = value.parse::<f64>() else {
         return value.to_owned();
     };

@@ -2,18 +2,20 @@
 
 A real-time crypto market-data terminal built in Rust. The interface runs in the browser through WebAssembly; a Rust server connects to exchange feeds and keeps the order books in sync. No JavaScript framework.
 
-Connect a Hyperliquid wallet address from the account button beside **Add widget** to see live open orders and perpetual positions. CHART marks orders and position entries; BOOK highlights own orders at levels present in Hyperliquid's depth feed. PRICES marks open orders for its selected sources; its config can hide them per widget. The account menu lists all open orders, including those beyond the book feed's 20 levels. Use the eye beside an account to hide its widget overlays without disconnecting it. This is read-only: no signing or API key is needed. Multiple wallet addresses can be saved locally in the browser. Hyperliquid limits live user subscriptions to 10 distinct addresses.
+Connect a Hyperliquid wallet address from the account button beside **Add Widget** to see live open orders and perpetual positions. CHART marks orders and position entries; BOOK highlights own orders at levels present in Hyperliquid's depth feed. PRICES marks open orders for its selected sources; its config can hide them per widget. The account menu lists all open orders, including those beyond the book feed's 20 levels. Use the eye beside an account to hide its widget overlays without disconnecting it. This is read-only: no signing or API key is needed. Multiple wallet addresses can be saved locally in the browser. Hyperliquid limits live user subscriptions to 10 distinct addresses.
 
 ![Terminal with charts, price comparison, order books, and trades tape](docs/screenshots/overview.jpg)
 
 ## What it does
 
 - **Twelve exchanges:** Binance, OKX, Bybit, Hyperliquid, Gate, Lighter, Bitget, Aster, Bitunix, KuCoin, Kraken, and Pacifica. Choose Spot or Perp and a symbol separately for each widget.
-- **Four widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, and trades tape.
+- **Five widgets:** live candlestick chart, scrollable order book, multi-venue price comparison, trades tape, and DOM price ladder.
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
 
 Enable **Show orderflow** in PRICES config for buy/sell quote volume grouped into UTC seconds. SELL bars extend above zero, BUY below. The current second updates with each trade event. Choose a source beneath the price chart; **All sources** is available when base assets and quote currencies match. Hover either plot for per-second buy/sell volumes and delta (`Buy − Sell`) in both base and quote units. Unknown trade sides are excluded from delta and reported separately in the tooltip. Volume is collected live for up to 600 seconds, independently of the price plot's point limit.
+
+**DOM** combines resting BID/ASK liquidity, executed SOLD/BOUGHT volume, and visible accounts' open ORDERS on one descending price ladder. Configure price grouping, a rolling trade window of 1–600 seconds, and base or quote sizes. Hover a level for both units. Scroll or drag to explore; double-click to recenter and follow the market. Executed volume is collected from live trades; unavailable book depth is marked `—`.
 
 Drag CHART or PRICES vertically to move the price range. Scroll over the right price scale to zoom it, or use Shift + scroll over CHART; PRICES also supports scrolling over the plot. Double-click the price scale to restore automatic scaling.
 
