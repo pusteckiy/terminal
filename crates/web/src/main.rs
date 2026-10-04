@@ -1,3 +1,4 @@
+mod orderflow;
 mod view;
 
 use std::{
@@ -169,6 +170,7 @@ struct Pane {
     compare_mode: CompareMode,
     compare_window_secs: u32,
     compare_show_orders: bool,
+    orderflow: orderflow::Settings,
     #[serde(skip)]
     chart: view::ChartView,
     #[serde(skip)]
@@ -201,6 +203,7 @@ impl Pane {
             compare_mode: CompareMode::default(),
             compare_window_secs: default_compare_window_secs(),
             compare_show_orders: default_compare_show_orders(),
+            orderflow: orderflow::Settings::default(),
             chart: view::ChartView::default(),
             compare_view: view::YAxisView::default(),
             book_view: view::BookView::default(),
@@ -230,6 +233,8 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_window_secs: u32,
                 #[serde(default = "default_compare_show_orders")]
                 compare_show_orders: bool,
+                #[serde(default)]
+                orderflow: orderflow::Settings,
             },
             Legacy(WidgetKind),
         }
@@ -242,6 +247,7 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_mode,
                 compare_window_secs,
                 compare_show_orders,
+                orderflow,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -251,6 +257,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.compare_mode = compare_mode;
                 pane.compare_window_secs = compare_window_secs.clamp(10, 600);
                 pane.compare_show_orders = compare_show_orders;
+                pane.orderflow = orderflow;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -269,6 +276,8 @@ struct MarketData {
     best_bid_ask: Option<BestBidAsk>,
     last_price: Option<LastPrice>,
     price_trades: VecDeque<TradePoint>,
+    latest_trade: Option<TradePoint>,
+    orderflow: orderflow::History,
     trades: VecDeque<Trade>,
     quotes: VecDeque<QuoteTick>,
     connected: bool,
@@ -299,12 +308,20 @@ impl MarketData {
             && price.is_finite()
             && price > 0.0
         {
-            self.price_trades.push_back(TradePoint {
+            let point = TradePoint {
                 time_ms: trade.time_ms,
                 price,
                 size: trade.size.parse().unwrap_or(0.0),
                 side: trade.side,
-            });
+            };
+            if self
+                .latest_trade
+                .is_none_or(|latest| point.time_ms >= latest.time_ms)
+            {
+                self.latest_trade = Some(point);
+            }
+            self.orderflow.push(point);
+            self.price_trades.push_back(point);
             let latest_ms = self
                 .last_price
                 .as_ref()
@@ -1368,8 +1385,11 @@ fn compare_editor(
         );
     });
     if pane.compare_mode == CompareMode::Trades {
-        ui.checkbox(&mut pane.compare_percent, "Compare % change");
+        ui.checkbox(&mut pane.compare_percent, "Compare % change")
+            .on_hover_text("Compare all prices against the latest trade of the first source (0%)");
     }
+    ui.checkbox(&mut pane.orderflow.enabled, "Show orderflow")
+        .on_hover_text("Live buy/sell volume grouped into UTC seconds; hover for delta");
     ui.checkbox(&mut pane.compare_show_orders, "Show account orders")
         .on_hover_text("Show open orders from visible accounts on this Prices widget");
     ui.label(
@@ -1749,6 +1769,13 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 &own_orders,
             ),
             WidgetKind::Compare => {
+                if pane.orderflow.enabled {
+                    self.needed_catalogs.extend(
+                        pane.series
+                            .iter()
+                            .map(|market| (market.exchange, market.kind)),
+                    );
+                }
                 let orders = if pane.compare_show_orders {
                     visible_source_orders(
                         &pane.series,
@@ -1765,6 +1792,8 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     pane.compare_mode,
                     pane.compare_percent,
                     pane.compare_window_secs,
+                    &mut pane.orderflow,
+                    self.catalogs,
                     &orders,
                     &mut pane.compare_view,
                 );
@@ -2165,10 +2194,15 @@ mod tests {
         assert_eq!(pane.compare_mode, CompareMode::Trades);
         assert_eq!(pane.compare_window_secs, 60);
         assert!(pane.compare_show_orders);
+        assert!(!pane.orderflow.enabled);
         let mut pane = pane;
         pane.compare_show_orders = false;
+        pane.orderflow.enabled = true;
+        pane.orderflow.source = Some(pane.series[0].clone());
         let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
         assert!(!restored.compare_show_orders);
+        assert!(restored.orderflow.enabled);
+        assert_eq!(restored.orderflow.source, Some(pane.series[0].clone()));
     }
 
     #[test]
@@ -2244,6 +2278,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TradeSide::Buy, TradeSide::Sell, TradeSide::Buy]
         );
+    }
+
+    #[test]
+    fn orderflow_volume_survives_price_point_and_tape_limits() {
+        let mut data = MarketData::default();
+        for _ in 0..=MAX_TRADE_POINTS {
+            data.push_trade(Trade {
+                price: "100".into(),
+                size: "0.5".into(),
+                time_ms: 1_500,
+                side: TradeSide::Buy,
+            });
+        }
+        assert_eq!(data.price_trades.len(), MAX_TRADE_POINTS);
+        assert_eq!(data.trades.len(), MAX_TAPE_TRADES);
+        let bucket = data.orderflow.buckets.front().unwrap();
+        assert_eq!(bucket.trades, MAX_TRADE_POINTS as u64 + 1);
+        assert_eq!(bucket.buy.quote, (MAX_TRADE_POINTS + 1) as f64 * 50.0);
     }
 
     #[test]

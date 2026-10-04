@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use terminal_core::{
-    Account, Book, Candle, Exchange, Level, Market, OwnOrder, Position, Trade, TradeSide,
+    Account, Book, Candle, Exchange, Level, Market, MarketKind, OwnOrder, Position, SymbolInfo,
+    Trade, TradeSide,
 };
 
+use crate::orderflow::{self, Bucket, Settings as OrderflowSettings, Units};
 use crate::{CompareMode, MAX_TAPE_TRADES, MarketData, TradePoint};
 
 const PANEL: Color32 = crate::SURFACE;
@@ -1298,6 +1300,8 @@ fn compare_sources_table(
     data: &HashMap<Market, MarketData>,
     mode: CompareMode,
     window_secs: u32,
+    percent: bool,
+    reference: Option<f64>,
 ) {
     const ROW_HEIGHT: f32 = 15.0;
     const CHART_SPACE: f32 = 150.0;
@@ -1330,7 +1334,9 @@ fn compare_sources_table(
     painter.text(
         Pos2::new(right, header.center().y),
         Align2::RIGHT_CENTER,
-        if mode == CompareMode::Trades {
+        if percent {
+            "Δ %"
+        } else if mode == CompareMode::Trades {
             "LAST"
         } else {
             "ASK"
@@ -1390,12 +1396,19 @@ fn compare_sources_table(
                         MUTED,
                     );
                 let market_data = data.get(market);
+                let live_last = market_data
+                    .and_then(|data| data.latest_trade)
+                    .map(|trade| trade.price.to_string());
                 let (bid, last) = match mode {
                     CompareMode::Trades => (
                         None,
-                        market_data
-                            .and_then(|data| data.last_price.as_ref())
-                            .map(|price| compact_decimal(&price.price)),
+                        if percent {
+                            live_last.as_deref()
+                        } else {
+                            market_data
+                                .and_then(|data| data.last_price.as_ref())
+                                .map(|price| compact_decimal(&price.price))
+                        },
                     ),
                     CompareMode::BestBidAsk => {
                         let quote = market_data.and_then(|data| data.best_bid_ask.as_ref());
@@ -1404,6 +1417,16 @@ fn compare_sources_table(
                             quote.map(|quote| compact_decimal(&quote.ask)),
                         )
                     }
+                };
+                let relative = reference.and_then(|reference| {
+                    market_data?.latest_trade.map(|trade| {
+                        format!("{:+.6}%", comparison_value(trade.price, Some(reference)))
+                    })
+                });
+                let displayed_last = if percent {
+                    relative.as_deref().unwrap_or("—")
+                } else {
+                    last.unwrap_or("—")
                 };
                 if let Some(bid) = bid {
                     painter
@@ -1434,11 +1457,15 @@ fn compare_sources_table(
                     .text(
                         Pos2::new(right, center),
                         Align2::RIGHT_CENTER,
-                        last.unwrap_or("—"),
+                        displayed_last,
                         font.clone(),
                         color,
                     );
                 let details = match mode {
+                    CompareMode::Trades if percent => format!(
+                        "{name} · Last {} · {displayed_last} vs first source's latest trade",
+                        last.unwrap_or("—")
+                    ),
                     CompareMode::Trades => format!("{name} · Last {}", last.unwrap_or("—")),
                     CompareMode::BestBidAsk => format!(
                         "{name} · Bid {} · Ask {}",
@@ -1458,10 +1485,16 @@ pub fn compare_ui(
     mode: CompareMode,
     percent: bool,
     window_secs: u32,
+    flow_settings: &mut OrderflowSettings,
+    catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     orders: &[(usize, &Account, &OwnOrder)],
     view: &mut YAxisView,
 ) {
-    compare_sources_table(ui, markets, data, mode, window_secs);
+    let percent = percent && mode == CompareMode::Trades;
+    let reference = percent
+        .then(|| comparison_reference(markets, data))
+        .flatten();
+    compare_sources_table(ui, markets, data, mode, window_secs, percent, reference);
     ui.add_space(4.0);
 
     let size = ui.available_size();
@@ -1471,11 +1504,43 @@ pub fn compare_ui(
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, PANEL);
-    let plot = Rect::from_min_max(
+    let mut plot = Rect::from_min_max(
         Pos2::new(rect.left() + 14.0, rect.top() + 14.0),
         Pos2::new(rect.right() - 78.0, rect.bottom() - 30.0),
     );
     if plot.width() < 80.0 || plot.height() < 80.0 {
+        return;
+    }
+    let flow_plot = if flow_settings.enabled && plot.height() >= 150.0 {
+        let height = (plot.height() * 0.25).clamp(50.0, 140.0);
+        let flow = Rect::from_min_max(
+            Pos2::new(plot.left(), plot.bottom() - height),
+            plot.right_bottom(),
+        );
+        plot.max.y = flow.top() - 28.0;
+        Some(flow)
+    } else {
+        None
+    };
+    let flow_source = flow_plot.and_then(|flow| {
+        let mut controls = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_max(
+                    Pos2::new(plot.left(), plot.bottom() + 4.0),
+                    Pos2::new(rect.right() - 9.0, flow.top() - 2.0),
+                ))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        orderflow_source_ui(&mut controls, markets, catalogs, flow_settings)
+    });
+    if percent && reference.is_none() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Waiting for first source's live trade…",
+            FontId::proportional(13.0),
+            MUTED,
+        );
         return;
     }
 
@@ -1484,7 +1549,7 @@ pub fn compare_ui(
         .filter_map(|market| data.get(market))
         .filter_map(|market_data| match mode {
             CompareMode::Trades => market_data
-                .last_price
+                .latest_trade
                 .as_ref()
                 .filter(|_| !market_data.price_trades.is_empty())
                 .map(|price| price.time_ms),
@@ -1519,10 +1584,8 @@ pub fn compare_ui(
                     .filter(|trade| trade.time_ms >= cutoff_ms)
                     .map(|trade| (trade.time_ms, trade.price))
                     .collect();
-                if percent && let Some(base) = points.first().map(|(_, price)| *price) {
-                    for (_, price) in &mut points {
-                        *price = (*price / base - 1.0) * 100.0;
-                    }
+                for (_, price) in &mut points {
+                    *price = comparison_value(*price, reference);
                 }
                 lines.push((points, color, 1.7));
             }
@@ -1562,8 +1625,7 @@ pub fn compare_ui(
     if !low.is_finite() || !high.is_finite() {
         return;
     }
-    let percent = percent && mode == CompareMode::Trades;
-    let pad = ((high - low) * 0.08).max(if percent { 0.01 } else { high.abs() * 0.0001 });
+    let pad = ((high - low) * 0.08).max(if percent { 0.0001 } else { high.abs() * 0.0001 });
     let (floor, ceiling) = view.interact(ui, &response, rect, plot, (low - pad, high + pad), true);
     let plot_painter = painter.with_clip_rect(plot);
     let x_for = |time: i64| {
@@ -1579,7 +1641,7 @@ pub fn compare_ui(
         );
         let value = ceiling - (ceiling - floor) * tick as f64 / 4.0;
         let label = if percent {
-            format!("{value:+.2}%")
+            format!("{value:+.4}%")
         } else {
             price_text(value)
         };
@@ -1590,30 +1652,50 @@ pub fn compare_ui(
             FontId::monospace(10.0),
             MUTED,
         );
-        if tick % 2 == 0 {
-            let time = start_ms + (end_ms - start_ms) * tick / 4;
-            let seconds = time.div_euclid(1000);
-            let label = if end_ms - start_ms >= 300_000 {
-                format!(
-                    "{:02}:{:02}",
-                    seconds.div_euclid(3_600).rem_euclid(24),
-                    seconds.div_euclid(60).rem_euclid(60)
-                )
-            } else {
-                format!(
-                    "{:02}:{:02}",
-                    seconds.div_euclid(60).rem_euclid(60),
-                    seconds.rem_euclid(60)
-                )
-            };
-            painter.text(
-                Pos2::new(x_for(time), plot.bottom() + 12.0),
-                Align2::CENTER_CENTER,
-                label,
-                FontId::monospace(10.0),
-                MUTED,
+    }
+    // Keep seconds visible even in long windows, with enough space between labels.
+    let time_intervals = ((plot.width() / 50.0) as i64)
+        .clamp(2, 12)
+        .min((end_ms - start_ms) / 1_000);
+    let time_axis_bottom = flow_plot.unwrap_or(plot).bottom();
+    for tick in 0..=time_intervals {
+        let time = start_ms + (end_ms - start_ms) * tick / time_intervals;
+        let seconds = time.div_euclid(1_000);
+        let x = x_for(time);
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(1.0, GRID.gamma_multiply(0.45)),
+        );
+        if let Some(flow) = flow_plot {
+            painter.line_segment(
+                [Pos2::new(x, flow.top()), Pos2::new(x, flow.bottom())],
+                Stroke::new(1.0, GRID.gamma_multiply(0.45)),
             );
         }
+        painter.line_segment(
+            [
+                Pos2::new(x, time_axis_bottom + 2.0),
+                Pos2::new(x, time_axis_bottom + 5.0),
+            ],
+            Stroke::new(1.0, GRID),
+        );
+        painter.text(
+            Pos2::new(x, time_axis_bottom + 13.0),
+            if tick == 0 {
+                Align2::LEFT_CENTER
+            } else if tick == time_intervals {
+                Align2::RIGHT_CENTER
+            } else {
+                Align2::CENTER_CENTER
+            },
+            format!(
+                "{:02}:{:02}",
+                seconds.div_euclid(60).rem_euclid(60),
+                seconds.rem_euclid(60)
+            ),
+            FontId::monospace(9.0),
+            MUTED,
+        );
     }
     for (points, color, width) in &lines {
         let simplified = (points.len() > plot.width() as usize * 4)
@@ -1637,17 +1719,8 @@ pub fn compare_ui(
     let order_levels: Vec<_> = orders
         .iter()
         .filter_map(|(index, account, order)| {
-            let market = markets.get(*index)?;
-            let base = if percent {
-                data.get(market)?
-                    .price_trades
-                    .iter()
-                    .find(|trade| trade.time_ms >= cutoff_ms)
-                    .map(|trade| trade.price)?
-            } else {
-                1.0
-            };
-            let value = order_plot_value(&order.price, base, percent)?;
+            markets.get(*index)?;
+            let value = order_plot_value(&order.price, reference.unwrap_or(1.0), percent)?;
             (floor..=ceiling)
                 .contains(&value)
                 .then_some((*index, *account, *order, y_for(value)))
@@ -1686,14 +1759,9 @@ pub fn compare_ui(
             let Some(first) = trades.next() else {
                 continue;
             };
-            let base = first.price;
             let fallback = SERIES_COLORS[index % SERIES_COLORS.len()];
             let position = |trade: &TradePoint| {
-                let price = if percent {
-                    (trade.price / base - 1.0) * 100.0
-                } else {
-                    trade.price
-                };
+                let price = comparison_value(trade.price, reference);
                 Pos2::new(x_for(trade.time_ms), y_for(price))
             };
             let draw_trade = |trade: &TradePoint| {
@@ -1724,7 +1792,7 @@ pub fn compare_ui(
                 }
                 draw_trade(pending);
             }
-            if let Some(latest) = market_data.price_trades.back() {
+            if let Some(latest) = market_data.latest_trade.as_ref() {
                 draw_trade(latest);
             }
         }
@@ -1743,22 +1811,12 @@ pub fn compare_ui(
                 let Some(market_data) = data.get(market) else {
                     continue;
                 };
-                let base = market_data
-                    .price_trades
-                    .iter()
-                    .find(|trade| trade.time_ms >= cutoff_ms)
-                    .map(|trade| trade.price)
-                    .unwrap_or(1.0);
                 for trade in market_data
                     .price_trades
                     .iter()
                     .filter(|trade| trade.time_ms >= cutoff_ms)
                 {
-                    let value = if percent {
-                        (trade.price / base - 1.0) * 100.0
-                    } else {
-                        trade.price
-                    };
+                    let value = comparison_value(trade.price, reference);
                     let position = Pos2::new(x_for(trade.time_ms), y_for(value));
                     if !plot.contains(position) {
                         continue;
@@ -1786,7 +1844,7 @@ pub fn compare_ui(
                         Pos2::new(plot.left() + 3.0, rect.top() + 7.0),
                         Align2::LEFT_CENTER,
                         format!(
-                            "{} · {} {} {} · {} UTC · {} × {}",
+                            "{} · {} {} {} · {} UTC · {} × {}{}",
                             trade_side_label(trade.side),
                             venue_code(market.exchange),
                             market.kind.label(),
@@ -1794,6 +1852,10 @@ pub fn compare_ui(
                             trade_utc(trade.time_ms, false),
                             trade.price,
                             trade.size,
+                            reference.map_or_else(String::new, |_| format!(
+                                " · {:+.6}%",
+                                comparison_value(trade.price, reference)
+                            )),
                         ),
                         FontId::monospace(9.0),
                         TEXT,
@@ -1801,35 +1863,342 @@ pub fn compare_ui(
             }
         }
     }
+    if let Some(flow) = flow_plot {
+        let buckets = orderflow::collect(markets, flow_source.as_ref(), data, start_ms, end_ms);
+        orderflow_plot(
+            &painter,
+            flow,
+            rect.right() - 9.0,
+            &buckets,
+            Units::Quote,
+            &x_for,
+        );
+        if let Some(pointer) = response
+            .hover_pos()
+            .filter(|pointer| plot.contains(*pointer) || flow.contains(*pointer))
+        {
+            painter.line_segment(
+                [
+                    Pos2::new(pointer.x, plot.top()),
+                    Pos2::new(pointer.x, flow.bottom()),
+                ],
+                Stroke::new(1.0, MUTED.gamma_multiply(0.6)),
+            );
+            let second = (start_ms as f64
+                + f64::from((pointer.x - plot.left()) / plot.width()) * (end_ms - start_ms) as f64)
+                .floor() as i64
+                / 1_000;
+            if let Some(bucket) = buckets.iter().find(|bucket| bucket.second == second) {
+                let (base_unit, quote_unit) = flow_source
+                    .as_ref()
+                    .or_else(|| markets.first())
+                    .and_then(|market| orderflow::symbol_info(market, catalogs))
+                    .map(|info| (info.base.as_str(), info.quote.as_str()))
+                    .unwrap_or(("Base", "Quote"));
+                response.clone().on_hover_ui_at_pointer(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} UTC", trade_utc(second * 1_000, true)))
+                            .small(),
+                    );
+                    egui::Grid::new("orderflow-hover").show(ui, |ui| {
+                        ui.label("");
+                        ui.label(egui::RichText::new(base_unit).small().color(MUTED));
+                        ui.label(egui::RichText::new(quote_unit).small().color(MUTED));
+                        ui.end_row();
+                        for (label, base, quote, color) in [
+                            ("Buy", bucket.buy.base, bucket.buy.quote, GREEN),
+                            ("Sell", bucket.sell.base, bucket.sell.quote, RED),
+                            (
+                                "Delta",
+                                bucket.delta(Units::Base),
+                                bucket.delta(Units::Quote),
+                                TEXT,
+                            ),
+                        ] {
+                            ui.label(egui::RichText::new(label).color(color));
+                            for value in [base, quote] {
+                                let sign = if label == "Delta" && value > 0.0 {
+                                    "+"
+                                } else if value < 0.0 {
+                                    "−"
+                                } else {
+                                    ""
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{sign}{}",
+                                        quote_size_text(&value.abs().to_string())
+                                    ))
+                                    .monospace()
+                                    .color(color),
+                                );
+                            }
+                            ui.end_row();
+                        }
+                        if bucket.unknown.base > 0.0 {
+                            ui.label("Unknown");
+                            ui.label(quote_size_text(&bucket.unknown.base.to_string()));
+                            ui.label(quote_size_text(&bucket.unknown.quote.to_string()));
+                            ui.end_row();
+                        }
+                        ui.label("Trade events");
+                        ui.label(bucket.trades.to_string());
+                        ui.label("");
+                        ui.end_row();
+                    });
+                    if flow_source.is_none() && markets.len() > 1 {
+                        ui.separator();
+                        for market in markets {
+                            if let Some(bucket) = data.get(market).and_then(|feed| {
+                                feed.orderflow
+                                    .buckets
+                                    .iter()
+                                    .find(|bucket| bucket.second == second)
+                            }) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {} · B {} / S {}",
+                                        venue_code(market.exchange),
+                                        market.kind.label(),
+                                        quote_size_text(&bucket.buy.quote.to_string()),
+                                        quote_size_text(&bucket.sell.quote.to_string())
+                                    ))
+                                    .small(),
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
     if let Some((index, account, order, y)) = hovered_order {
         let market = &markets[*index];
         let color = trade_color(order.side, MUTED);
+        let quote_size = order
+            .price
+            .parse::<rust_decimal::Decimal>()
+            .ok()
+            .zip(order.size.parse::<rust_decimal::Decimal>().ok())
+            .and_then(|(price, size)| price.checked_mul(size))
+            .map(|value| quote_size_text(&value.to_string()))
+            .unwrap_or_else(|| "—".to_owned());
+        let details = format!("{} × {} · {} quote", order.price, order.size, quote_size);
+        let account_suffix = &account.address[account.address.len().saturating_sub(4)..];
+        let mut label = format!(
+            "ORDER {} · {} {} {} · {details} · …{account_suffix}",
+            trade_side_label(order.side),
+            venue_code(market.exchange),
+            market.kind.label(),
+            market.symbol,
+        );
+        let font = FontId::monospace(9.0);
+        let header = Rect::from_min_max(
+            Pos2::new(plot.left(), rect.top()),
+            Pos2::new(rect.right() - 9.0, plot.top()),
+        );
+        if painter
+            .layout_no_wrap(label.clone(), font.clone(), color)
+            .size()
+            .x
+            > header.width()
+        {
+            // Keep price, base size, and quote size visible in narrow widgets.
+            label = format!(
+                "{} · {details} · {} {} {} · …{account_suffix}",
+                trade_side_label(order.side),
+                venue_code(market.exchange),
+                market.kind.label(),
+                market.symbol,
+            );
+        }
         painter.line_segment(
             [Pos2::new(plot.left(), *y), Pos2::new(plot.right(), *y)],
             Stroke::new(1.4, color),
         );
-        painter
-            .with_clip_rect(Rect::from_min_max(
-                Pos2::new(plot.left(), rect.top()),
-                Pos2::new(plot.right(), plot.top()),
-            ))
-            .text(
-                Pos2::new(plot.left() + 3.0, rect.top() + 7.0),
-                Align2::LEFT_CENTER,
-                format!(
-                    "ORDER {} · {} {} {} · {} × {} · …{}",
-                    trade_side_label(order.side),
-                    venue_code(market.exchange),
-                    market.kind.label(),
-                    market.symbol,
-                    order.price,
-                    order.size,
-                    &account.address[account.address.len().saturating_sub(4)..],
-                ),
-                FontId::monospace(9.0),
-                color,
-            );
+        painter.with_clip_rect(header).text(
+            Pos2::new(plot.left() + 3.0, rect.top() + 7.0),
+            Align2::LEFT_CENTER,
+            label,
+            font,
+            color,
+        );
     }
+}
+
+fn orderflow_source_ui(
+    ui: &mut egui::Ui,
+    markets: &[Market],
+    catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
+    settings: &mut OrderflowSettings,
+) -> Option<Market> {
+    if settings
+        .source
+        .as_ref()
+        .is_some_and(|source| !markets.contains(source))
+    {
+        settings.source = None;
+    }
+    let compatible = orderflow::compatible(markets, catalogs, Units::Quote);
+    let effective_source = |settings: &OrderflowSettings| {
+        settings
+            .source
+            .clone()
+            .or_else(|| (!compatible).then(|| markets.first().cloned()).flatten())
+    };
+    let selected = effective_source(settings);
+    ui.label(
+        egui::RichText::new("FLOW · 1s")
+            .monospace()
+            .size(9.0)
+            .color(MUTED),
+    )
+    .on_hover_text(
+        "SELL above · BUY below · Hover for volumes and delta. Collected live since subscription.",
+    );
+    egui::ComboBox::from_id_salt("orderflow-source")
+        .width(115.0)
+        .selected_text(selected.as_ref().map_or_else(|| "All sources".to_owned(), |market| format!("{} {}", venue_code(market.exchange), market.symbol)))
+        .show_ui(ui, |ui| {
+            ui.add_enabled_ui(compatible, |ui| {
+                ui.selectable_value(&mut settings.source, None, "All sources");
+            }).response.on_disabled_hover_text("All sources requires matching assets and volume units. Quote currencies are kept separate.");
+            for market in markets {
+                ui.selectable_value(&mut settings.source, Some(market.clone()), format!("{} {} {}", market.exchange.label(), market.kind.label(), market.symbol));
+            }
+        });
+    let source = effective_source(settings);
+    let unit = source
+        .as_ref()
+        .or_else(|| markets.first())
+        .and_then(|market| orderflow::symbol_info(market, catalogs))
+        .map(|info| info.quote.as_str())
+        .unwrap_or("quote");
+    ui.label(egui::RichText::new(unit).monospace().size(9.0).color(MUTED));
+    source
+}
+
+fn orderflow_plot(
+    painter: &egui::Painter,
+    plot: Rect,
+    label_right: f32,
+    buckets: &[Bucket],
+    units: Units,
+    x_for: &impl Fn(i64) -> f32,
+) {
+    let mid = plot.center().y;
+    let maximum = buckets
+        .iter()
+        .flat_map(|bucket| [bucket.buy.value(units), bucket.sell.value(units)])
+        .fold(0.0_f64, f64::max);
+    let axis_max = flow_axis_max(maximum);
+    let scale = f64::from(plot.height() * 0.5) / axis_max;
+    let clipped = painter.with_clip_rect(plot);
+    clipped.line_segment(
+        [Pos2::new(plot.left(), mid), Pos2::new(plot.right(), mid)],
+        Stroke::new(1.0, GRID),
+    );
+    for bucket in buckets {
+        let left = x_for(bucket.second * 1_000).max(plot.left());
+        let right = x_for((bucket.second + 1) * 1_000).min(plot.right());
+        if right < left {
+            continue;
+        }
+        let inset = ((right - left) * 0.12).min(1.0);
+        let width = (right - left - inset * 2.0).max(0.6);
+        for (value, color, sell) in [
+            (bucket.sell.value(units), RED, true),
+            (bucket.buy.value(units), GREEN, false),
+        ] {
+            if value <= 0.0 {
+                continue;
+            }
+            let height = ((value * scale) as f32).max(0.8);
+            clipped.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(left + inset, if sell { mid - height } else { mid }),
+                    Vec2::new(width, height),
+                ),
+                0.0,
+                color.gamma_multiply(0.8),
+            );
+        }
+    }
+    let maximum_label = quote_size_text(&axis_max.to_string());
+    for (y, align, label, color) in [
+        (
+            plot.top(),
+            Align2::RIGHT_TOP,
+            format!("SELL {maximum_label}"),
+            RED,
+        ),
+        (mid, Align2::RIGHT_CENTER, "0".to_owned(), MUTED),
+        (
+            plot.bottom(),
+            Align2::RIGHT_BOTTOM,
+            format!("BUY {maximum_label}"),
+            GREEN,
+        ),
+    ] {
+        painter.text(
+            Pos2::new(label_right, y),
+            align,
+            label,
+            FontId::monospace(9.0),
+            color,
+        );
+    }
+    if plot.height() >= 80.0 {
+        let label = quote_size_text(&(axis_max * 0.5).to_string());
+        for (y, color) in [
+            (mid - plot.height() * 0.25, RED),
+            (mid + plot.height() * 0.25, GREEN),
+        ] {
+            clipped.line_segment(
+                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+                Stroke::new(1.0, GRID.gamma_multiply(0.5)),
+            );
+            painter.text(
+                Pos2::new(label_right, y),
+                Align2::RIGHT_CENTER,
+                &label,
+                FontId::monospace(9.0),
+                color.gamma_multiply(0.7),
+            );
+        }
+    }
+    if buckets.iter().all(|bucket| bucket.trades == 0) {
+        clipped.text(
+            plot.center_top() + Vec2::new(0.0, 5.0),
+            Align2::CENTER_TOP,
+            "Waiting for live trades…",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+    }
+}
+
+fn flow_axis_max(maximum: f64) -> f64 {
+    if maximum <= 0.0 || !maximum.is_finite() {
+        return 1.0;
+    }
+    let target = maximum * 1.1;
+    let magnitude = 10.0_f64.powf(target.log10().floor());
+    [1.0, 2.0, 2.5, 5.0, 10.0]
+        .into_iter()
+        .map(|step| step * magnitude)
+        .find(|value| *value >= target)
+        .unwrap_or(target)
+}
+
+fn comparison_reference(markets: &[Market], data: &HashMap<Market, MarketData>) -> Option<f64> {
+    data.get(markets.first()?)?
+        .latest_trade
+        .map(|trade| trade.price)
+}
+
+fn comparison_value(price: f64, reference: Option<f64>) -> f64 {
+    reference.map_or(price, |base| (price - base) / base * 100.0)
 }
 
 fn order_plot_value(price: &str, base: f64, percent: bool) -> Option<f64> {
@@ -1838,7 +2207,7 @@ fn order_plot_value(price: &str, base: f64, percent: bool) -> Option<f64> {
         return None;
     }
     Some(if percent {
-        (price / base - 1.0) * 100.0
+        comparison_value(price, Some(base))
     } else {
         price
     })
@@ -1847,10 +2216,13 @@ fn order_plot_value(price: &str, base: f64, percent: bool) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChartView, YAxisView, book_scroll_bounds, execution_metrics, order_plot_value,
-        own_orders_at, quote_size_text, simplify_points, trade_utc,
+        ChartView, YAxisView, book_scroll_bounds, comparison_reference, comparison_value,
+        execution_metrics, order_plot_value, own_orders_at, quote_size_text, simplify_points,
+        trade_utc,
     };
-    use terminal_core::{Account, Exchange, Level, OwnOrder, TradeSide};
+    use crate::MarketData;
+    use std::collections::HashMap;
+    use terminal_core::{Account, Exchange, LastPrice, Level, Market, OwnOrder, Trade, TradeSide};
 
     #[test]
     fn chart_history_boundary_keeps_a_full_visible_window() {
@@ -1907,10 +2279,68 @@ mod tests {
     }
 
     #[test]
-    fn own_order_uses_source_baseline_in_percent_comparison() {
+    fn own_order_uses_shared_baseline_in_percent_comparison() {
         assert!((order_plot_value("105", 100.0, true).unwrap() - 5.0).abs() < 1e-10);
         assert_eq!(order_plot_value("105", 100.0, false), Some(105.0));
         assert_eq!(order_plot_value("0", 100.0, true), None);
+    }
+
+    #[test]
+    fn percent_comparison_uses_first_sources_latest_trade_for_every_price() {
+        let markets = [
+            Market::for_exchange(Exchange::Binance),
+            Market::for_exchange(Exchange::Hyperliquid),
+        ];
+        let mut data = HashMap::new();
+        for (market, trades) in markets.iter().zip([
+            [(1_000, "100"), (2_000, "200")],
+            [(1_000, "80"), (2_500, "220")],
+        ]) {
+            let mut feed = MarketData::default();
+            for (time_ms, price) in trades {
+                feed.push_trade(Trade {
+                    time_ms,
+                    price: price.into(),
+                    size: "1".into(),
+                    side: TradeSide::Buy,
+                });
+            }
+            data.insert(market.clone(), feed);
+        }
+        let reference = comparison_reference(&markets, &data);
+        assert_eq!(reference, Some(200.0));
+        assert_eq!(comparison_value(200.0, reference), 0.0);
+        assert_eq!(comparison_value(220.0, reference), 10.0);
+        assert_eq!(comparison_value(100.0, reference), -50.0);
+        assert_eq!(order_plot_value("210", reference.unwrap(), true), Some(5.0));
+
+        let first = data.get_mut(&markets[0]).unwrap();
+        // A snapshot price or delayed trade cannot replace the newest actual trade.
+        first.set_price(LastPrice {
+            time_ms: 4_000,
+            price: "999".into(),
+        });
+        first.push_trade(Trade {
+            time_ms: 1_500,
+            price: "50".into(),
+            size: "1".into(),
+            side: TradeSide::Sell,
+        });
+        assert_eq!(comparison_reference(&markets, &data), Some(200.0));
+        data.get_mut(&markets[0]).unwrap().push_trade(Trade {
+            time_ms: 3_000,
+            price: "220".into(),
+            size: "1".into(),
+            side: TradeSide::Buy,
+        });
+        assert_eq!(comparison_reference(&markets, &data), Some(220.0));
+        assert_eq!(
+            comparison_value(220.0, comparison_reference(&markets, &data)),
+            0.0
+        );
+        data.remove(&markets[0]);
+        assert_eq!(comparison_reference(&markets, &data), None);
+        assert_eq!(comparison_value(220.0, None), 220.0);
     }
 
     #[test]

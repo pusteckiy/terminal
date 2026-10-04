@@ -13,7 +13,11 @@ Connect a Hyperliquid wallet address from the account button beside **Add widget
 - **Flexible workspace:** drag widgets, resize tiles, and switch between saved terminal layouts. Settings are stored locally in the browser.
 - **Live data:** exchange WebSockets for books and trades; REST snapshots for initial book depth and candle history.
 
+Enable **Show orderflow** in PRICES config for buy/sell quote volume grouped into UTC seconds. SELL bars extend above zero, BUY below. The current second updates with each trade event. Choose a source beneath the price chart; **All sources** is available when base assets and quote currencies match. Hover either plot for per-second buy/sell volumes and delta (`Buy − Sell`) in both base and quote units. Unknown trade sides are excluded from delta and reported separately in the tooltip. Volume is collected live for up to 600 seconds, independently of the price plot's point limit.
+
 Drag CHART or PRICES vertically to move the price range. Scroll over the right price scale to zoom it, or use Shift + scroll over CHART; PRICES also supports scrolling over the plot. Double-click the price scale to restore automatic scaling.
+
+In PRICES Last trades mode, **Compare % change** uses the first source's latest trade as the shared reference: `(price − reference) / reference × 100`. The first source's latest trade is 0%; all chart history, trade markers, and account orders use that same current reference. The source list shows each venue's latest difference in percent.
 
 <img src="docs/screenshots/market-selection.jpg" alt="Per-widget exchange, market type, and symbol selection" width="520">
 
