@@ -15,6 +15,8 @@ Connect a Hyperliquid wallet address from the account button beside **Add Widget
 
 Hyperliquid **Perp** includes native and HIP-3 markets from all builder DEXs. Search for symbols such as `NVDA` (NVIDIA) or `SPCX`; DEX prefixes such as `xyz:NVDA` distinguish separate markets. These markets use the same charts, books, live prices, tape, and account widgets.
 
+Right-click a terminal tab and choose **Change symbol…** to switch its market widgets together, including every PRICES and TRADES source. Preview the venue symbols before applying; exchange, Spot/Perp, quote currency, and HIP-3 DEX stay the same. Unavailable sources pause with an explicit label. **Undo** is available for 10 seconds. FILLS keeps its account filters.
+
 Enable **Show orderflow** in PRICES config for buy/sell quote volume grouped into UTC seconds. SELL bars extend above zero, BUY below. The current second updates with each trade event. Choose a source beneath the price chart; **All sources** is available when base assets and quote currencies match. Hover either plot for per-second buy/sell volumes and delta (`Buy − Sell`) in both base and quote units. Unknown trade sides are excluded from delta and reported separately in the tooltip. Volume is collected live for up to 600 seconds, independently of the price plot's point limit.
 
 **DOM** combines resting BID/ASK liquidity, executed SOLD/BOUGHT volume, and visible accounts' open ORDERS on one descending price ladder. Configure price grouping, a rolling trade window of 1–600 seconds, and base or quote sizes. Hover a level for both units. Scroll or drag to explore; double-click to recenter and follow the market. Executed volume is collected from live trades; unavailable book depth is marked `—`.

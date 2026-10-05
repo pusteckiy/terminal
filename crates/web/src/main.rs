@@ -1,3 +1,4 @@
+mod batch;
 mod dom;
 mod fills;
 mod orderflow;
@@ -201,6 +202,8 @@ struct Pane {
     dom: dom::Settings,
     fills: fills::Settings,
     position: position::Settings,
+    unavailable_markets: Vec<Market>,
+    batch_symbol: Option<String>,
     #[serde(skip)]
     position_view: position::View,
     #[serde(skip)]
@@ -249,6 +252,8 @@ impl Pane {
             dom: dom::Settings::default(),
             fills: fills::Settings::default(),
             position: position::Settings::default(),
+            unavailable_markets: Vec::new(),
+            batch_symbol: None,
             position_view: position::View::default(),
             fills_view: fills::View::default(),
             dom_view: dom::View::default(),
@@ -289,6 +294,10 @@ impl<'de> Deserialize<'de> for Pane {
                 fills: fills::Settings,
                 #[serde(default)]
                 position: position::Settings,
+                #[serde(default)]
+                unavailable_markets: Vec<Market>,
+                #[serde(default)]
+                batch_symbol: Option<String>,
             },
             Legacy(WidgetKind),
         }
@@ -305,6 +314,8 @@ impl<'de> Deserialize<'de> for Pane {
                 dom,
                 fills,
                 position,
+                unavailable_markets,
+                batch_symbol,
             } => {
                 let mut pane = Pane::new(kind, market);
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
@@ -318,6 +329,8 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.dom = dom;
                 pane.fills = fills;
                 pane.position = position;
+                pane.unavailable_markets = unavailable_markets;
+                pane.batch_symbol = batch_symbol;
                 pane
             }
             SavedPane::Legacy(kind) => {
@@ -577,6 +590,8 @@ struct TerminalApp {
     workspaces: Vec<Tree<Pane>>,
     active_workspace: usize,
     tab_hover: Option<(usize, f64)>,
+    batch_change: Option<batch::Dialog>,
+    batch_undo: Option<batch::Undo>,
     data: HashMap<Market, MarketData>,
     catalogs: HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     catalog_errors: HashMap<(Exchange, MarketKind), String>,
@@ -644,6 +659,8 @@ impl TerminalApp {
             workspaces,
             active_workspace,
             tab_hover: None,
+            batch_change: None,
+            batch_undo: None,
             data: HashMap::new(),
             catalogs: HashMap::new(),
             catalog_errors: HashMap::new(),
@@ -745,12 +762,18 @@ impl TerminalApp {
                 } else if matches!(pane.kind, WidgetKind::Position) {
                     if pane.market.kind == MarketKind::Spot
                         && pane.position.metric == position::Metric::Notional
+                        && !pane.unavailable_markets.contains(&pane.market)
                     {
                         wanted.insert(pane.market.clone());
                     }
                 } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
-                    wanted.extend(pane.series.iter().cloned());
-                } else {
+                    wanted.extend(
+                        pane.series
+                            .iter()
+                            .filter(|market| !pane.unavailable_markets.contains(market))
+                            .cloned(),
+                    );
+                } else if !pane.unavailable_markets.contains(&pane.market) {
                     wanted.insert(pane.market.clone());
                 }
             }
@@ -761,6 +784,7 @@ impl TerminalApp {
             for (_, tile) in tree.tiles.iter() {
                 if let Tile::Pane(pane) = tile
                     && matches!(pane.kind, WidgetKind::Position)
+                    && !pane.unavailable_markets.contains(&pane.market)
                     && pane.market.kind == MarketKind::Spot
                     && pane.position.metric == position::Metric::Notional
                 {
@@ -830,6 +854,7 @@ impl TerminalApp {
             for (_, tile) in tree.tiles.iter_mut() {
                 if let Tile::Pane(pane) = tile
                     && matches!(pane.kind, WidgetKind::Position)
+                    && !pane.unavailable_markets.contains(&pane.market)
                     && changed_market.is_none_or(|market| market == &pane.market)
                 {
                     pane.position_view.observe(
@@ -1016,6 +1041,7 @@ impl TerminalApp {
         let mut switch_to = None;
         let mut remove_workspace = None;
         let mut create_workspace = false;
+        let mut change_symbol = None;
         let now = ui.input(|input| input.time);
         let mut hovered_tab = None;
         let header = ui.allocate_ui_with_layout(
@@ -1042,6 +1068,19 @@ impl TerminalApp {
                             _ => String::new(),
                         };
                         let response = ui.add_sized([29.0, 25.0], button);
+                        response.context_menu(|ui| {
+                            ui.set_min_width(160.0);
+                            ui.label(
+                                RichText::new(format!("Terminal {}", index + 1))
+                                    .small()
+                                    .color(MUTED),
+                            );
+                            ui.separator();
+                            if ui.button("Change symbol…").clicked() {
+                                change_symbol = Some(index);
+                                ui.close();
+                            }
+                        });
                         if response.clicked() {
                             switch_to = Some(index);
                         }
@@ -1049,12 +1088,23 @@ impl TerminalApp {
                             egui::pos2(response.rect.right() - 5.0, response.rect.top() + 5.0);
                         let badge_rect =
                             egui::Rect::from_center_size(badge_center, egui::vec2(16.0, 16.0));
-                        let pointer = ui.input(|input| input.pointer.hover_pos());
-                        let hovering = pointer.is_some_and(|pointer| {
-                            response.rect.contains(pointer)
-                                || (self.tab_hover.map(|(hovered, _)| hovered) == Some(index)
-                                    && badge_rect.contains(pointer))
+                        let corner_rect = egui::Rect::from_min_size(
+                            egui::pos2(response.rect.right() - 10.0, response.rect.top()),
+                            egui::vec2(10.0, 10.0),
+                        );
+                        let badge_visible = self.tab_hover.is_some_and(|(hovered, started)| {
+                            hovered == index && now - started >= TAB_DELETE_HOVER_SECS
                         });
+                        let pointer = ui.input(|input| input.pointer.hover_pos());
+                        let hovering = self.workspaces.len() > 1
+                            && !response.context_menu_opened()
+                            && pointer.is_some_and(|pointer| {
+                                if badge_visible {
+                                    badge_rect.contains(pointer)
+                                } else {
+                                    corner_rect.contains(pointer)
+                                }
+                            });
                         if hovering {
                             hovered_tab = Some(index);
                             if self.tab_hover.map(|(hovered, _)| hovered) != Some(index) {
@@ -1103,7 +1153,7 @@ impl TerminalApp {
                                     close.on_hover_text("Delete terminal");
                                 } else {
                                     response.on_hover_text(format!(
-                                        "Terminal {}{}",
+                                        "Terminal {}{}\nRight-click for terminal actions",
                                         index + 1,
                                         shortcut
                                     ));
@@ -1113,13 +1163,17 @@ impl TerminalApp {
                                     (TAB_DELETE_HOVER_SECS - (now - started)).max(0.0),
                                 ));
                                 response.on_hover_text(format!(
-                                    "Terminal {}{}",
+                                    "Terminal {}{}\nRight-click for terminal actions",
                                     index + 1,
                                     shortcut
                                 ));
                             }
                         } else {
-                            response.on_hover_text(format!("Terminal {}{}", index + 1, shortcut));
+                            response.on_hover_text(format!(
+                                "Terminal {}{}\nRight-click for terminal actions",
+                                index + 1,
+                                shortcut
+                            ));
                         }
                     }
                     let button = egui::Button::new(RichText::new("+").size(16.0).color(TEXT))
@@ -1230,6 +1284,9 @@ impl TerminalApp {
             self.workspaces
                 .push(Self::default_tree(self.workspaces.len()));
             self.switch_workspace(self.workspaces.len() - 1);
+        }
+        if let Some(index) = change_symbol {
+            self.batch_change = Some(batch::Dialog::new(index));
         }
         add
     }
@@ -1461,6 +1518,8 @@ impl TerminalApp {
             .collect();
         self.focused = None;
         self.tab_hover = None;
+        self.batch_change = None;
+        self.batch_undo = None;
         self.sync_subscriptions();
     }
 
@@ -1820,7 +1879,9 @@ impl Behavior<Pane> for PaneBehavior<'_> {
         }
         let old_market = pane.market.clone();
         let old_compare = (pane.series.clone(), pane.compare_mode, pane.compare_percent);
-        let live = if matches!(pane.kind, WidgetKind::Position) {
+        let live = if !pane.unavailable_markets.is_empty() {
+            false
+        } else if matches!(pane.kind, WidgetKind::Position) {
             position::is_live(
                 &pane.position,
                 &pane.market,
@@ -1864,7 +1925,16 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     )
                     .sense(Sense::drag()),
                 );
-                let subtitle = if matches!(pane.kind, WidgetKind::Fills) {
+                let subtitle = if pane.unavailable_markets.contains(&pane.market)
+                    && !matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape)
+                {
+                    format!(
+                        "{} {}  {}",
+                        pane.market.exchange.label(),
+                        pane.market.kind.label(),
+                        pane.batch_symbol.as_deref().unwrap_or(&pane.market.symbol)
+                    )
+                } else if matches!(pane.kind, WidgetKind::Fills) {
                     "Hyperliquid".to_owned()
                 } else if matches!(pane.kind, WidgetKind::Position)
                     && pane.market.kind == MarketKind::Spot
@@ -1977,12 +2047,20 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
                     ui.painter()
                         .circle_filled(rect.center(), 3.0, if live { GREEN } else { RED });
-                    response.on_hover_text(if live { "Live" } else { "Connecting" });
+                    response.on_hover_text(if !pane.unavailable_markets.is_empty() {
+                        "Market unavailable"
+                    } else if live {
+                        "Live"
+                    } else {
+                        "Connecting"
+                    });
                 });
                 title.drag_started()
             })
             .inner;
         if old_market != pane.market {
+            pane.unavailable_markets
+                .retain(|market| market != &old_market);
             pane.chart = view::ChartView::default();
             pane.book_view = view::BookView::default();
             pane.dom_view = dom::View::default();
@@ -1992,9 +2070,46 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             || old_compare.1 != pane.compare_mode
             || old_compare.2 != pane.compare_percent
         {
+            if old_compare.0 != pane.series {
+                pane.unavailable_markets
+                    .retain(|market| pane.series.contains(market));
+            }
             pane.compare_view = view::YAxisView::default();
         }
         ui.separator();
+        if !pane.unavailable_markets.is_empty() {
+            for market in &pane.unavailable_markets {
+                ui.label(
+                    RichText::new(format!(
+                        "{} unavailable on {} {}",
+                        pane.batch_symbol.as_deref().unwrap_or(&market.symbol),
+                        market.exchange.label(),
+                        market.kind.label()
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+            }
+            if !matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+                return if dragging {
+                    UiResponse::DragStarted
+                } else {
+                    UiResponse::None
+                };
+            }
+        }
+        let available_sources;
+        let sources = if pane.unavailable_markets.is_empty() {
+            &pane.series
+        } else {
+            available_sources = pane
+                .series
+                .iter()
+                .filter(|market| !pane.unavailable_markets.contains(market))
+                .cloned()
+                .collect::<Vec<_>>();
+            &available_sources
+        };
         let data = self.data.get(&pane.market);
         let market = &pane.market;
         let own_orders: Vec<_> =
@@ -2034,17 +2149,13 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     );
                 }
                 let orders = if pane.compare_show_orders {
-                    visible_source_orders(
-                        &pane.series,
-                        self.account_data,
-                        self.hidden_widget_accounts,
-                    )
+                    visible_source_orders(sources, self.account_data, self.hidden_widget_accounts)
                 } else {
                     Vec::new()
                 };
                 view::compare_ui(
                     ui,
-                    &pane.series,
+                    sources,
                     self.data,
                     pane.compare_mode,
                     pane.compare_percent,
@@ -2055,7 +2166,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     &mut pane.compare_view,
                 );
             }
-            WidgetKind::Tape => view::tape_ui(ui, &pane.series, self.data),
+            WidgetKind::Tape => view::tape_ui(ui, sources, self.data),
             WidgetKind::Position => {
                 self.needed_catalogs
                     .insert((pane.market.exchange, pane.market.kind));
@@ -2156,6 +2267,7 @@ impl eframe::App for TerminalApp {
         egui::Frame::new().fill(BG).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             let add = self.header(ui);
+            batch::ui(self, ui.ctx());
             let mut close = None;
             let mut needed_catalogs = HashSet::new();
             let mut retry_catalogs = HashSet::new();
@@ -2267,11 +2379,13 @@ mod tests {
             .collect()
     }
 
-    fn test_app() -> TerminalApp {
+    pub(super) fn test_app() -> TerminalApp {
         TerminalApp {
             workspaces: (0..3).map(TerminalApp::default_tree).collect(),
             active_workspace: 0,
             tab_hover: None,
+            batch_change: None,
+            batch_undo: None,
             data: HashMap::new(),
             catalogs: HashMap::new(),
             catalog_errors: HashMap::new(),
