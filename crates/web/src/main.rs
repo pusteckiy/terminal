@@ -1023,7 +1023,7 @@ impl TerminalApp {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                let tabs_width = (ui.available_width() - 140.0).max(100.0);
+                let tabs_width = (ui.available_width() - 260.0).max(100.0);
                 let mut tabs = |ui: &mut egui::Ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for index in 0..self.workspaces.len() {
@@ -1193,6 +1193,23 @@ impl TerminalApp {
                         });
                     response.on_hover_text("Add a widget beside the focused pane");
                     self.account_menu(ui);
+                    ui.add_space(4.0);
+                    let now_ms = utc_now_ms();
+                    let seconds = now_ms.div_euclid(1_000).rem_euclid(86_400);
+                    ui.label(
+                        RichText::new(format!(
+                            "{:02}:{:02}:{:02} UTC",
+                            seconds / 3_600,
+                            seconds / 60 % 60,
+                            seconds % 60,
+                        ))
+                        .monospace()
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                    ui.ctx().request_repaint_after(Duration::from_millis(
+                        (1_000 - now_ms.rem_euclid(1_000)) as u64,
+                    ));
                 });
             },
         );
