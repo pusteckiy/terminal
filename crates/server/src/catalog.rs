@@ -1,4 +1,4 @@
-use reqwest::Client;
+use crate::http::Client;
 use serde_json::{Value, json};
 use terminal_core::{Exchange, MarketKind, SymbolInfo};
 

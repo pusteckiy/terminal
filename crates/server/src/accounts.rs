@@ -369,7 +369,7 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                                 if applied {
                                     // Send a compact delta for each execution, rather than resending
                                     // the entire account's orders and positions on every fill.
-                                    let _ = state.updates.send(ServerMessage::AccountPosition {
+                                    let _ = state.publish(ServerMessage::AccountPosition {
                                         account: account.clone(), position,
                                     });
                                 }

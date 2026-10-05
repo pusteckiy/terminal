@@ -415,7 +415,27 @@ impl MarketData {
         self.last_price = Some(last_price);
     }
 
-    fn set_book(&mut self, book: Book, exchange: Exchange) {
+    fn set_book(&mut self, mut book: Book, exchange: Exchange) {
+        // REST/WS snapshots carry only price and base size. Derive quote sizes
+        // and cumulative depth locally, once, preserving Decimal precision.
+        for levels in [&mut book.bids, &mut book.asks] {
+            if levels.iter().any(|level| level.depth_quote.is_empty()) {
+                let (mut base, mut quote) = (Decimal::ZERO, Decimal::ZERO);
+                for level in levels {
+                    if let (Ok(price), Ok(size)) = (
+                        Decimal::from_str(&level.price),
+                        Decimal::from_str(&level.size),
+                    ) {
+                        let notional = price * size;
+                        base += size;
+                        quote += notional;
+                        level.quote_size = notional.normalize().to_string();
+                        level.depth_base = base.normalize().to_string();
+                        level.depth_quote = quote.normalize().to_string();
+                    }
+                }
+            }
+        }
         if !matches!(
             exchange,
             Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter | Exchange::Pacifica
@@ -2254,6 +2274,33 @@ mod tests {
             receiver: None,
             reconnect_at: 0.0,
         }
+    }
+
+    #[test]
+    fn compact_book_snapshot_rebuilds_exact_quote_and_cumulative_depth() {
+        let level = |price: &str, size: &str| Level {
+            price: price.into(),
+            size: size.into(),
+            quote_size: "unused".into(),
+            depth_base: "unused".into(),
+            depth_quote: "unused".into(),
+        };
+        let original = Book {
+            bids: vec![level("100.1", "2"), level("99.9", "3")],
+            asks: vec![level("100.2", "1")],
+            updated_at_ms: 10,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(!json.contains("depth_quote"));
+        assert!(!json.contains("quote_size"));
+        let mut data = MarketData::default();
+        data.set_book(serde_json::from_str(&json).unwrap(), Exchange::Binance);
+        let book = data.book.unwrap();
+        assert_eq!(book.bids.len(), 2);
+        assert_eq!(book.bids[0].quote_size, "200.2");
+        assert_eq!(book.bids[1].depth_base, "5");
+        assert_eq!(book.bids[1].depth_quote, "499.9");
+        assert_eq!(book.asks[0].depth_quote, "100.2");
     }
 
     #[test]

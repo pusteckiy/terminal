@@ -225,11 +225,11 @@ pub struct Candle {
 pub struct Level {
     pub price: String,
     pub size: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub quote_size: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub depth_base: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub depth_quote: String,
 }
 

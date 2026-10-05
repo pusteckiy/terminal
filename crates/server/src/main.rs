@@ -1,12 +1,17 @@
 mod accounts;
 mod catalog;
+mod catalog_cache;
 mod exchange;
+mod http;
 
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use axum::{
@@ -36,6 +41,7 @@ struct MarketState {
     best_bid_ask: Option<BestBidAsk>,
     last_price: Option<LastPrice>,
     connected: bool,
+    needs_candle_resync: bool,
 }
 
 impl MarketState {
@@ -83,30 +89,35 @@ impl MarketState {
 
 struct Worker {
     users: usize,
-    books: JoinHandle<()>,
+    books: Option<JoinHandle<()>>,
     candles: JoinHandle<()>,
-}
-
-#[derive(Clone)]
-struct CatalogEntry {
-    symbols: Vec<SymbolInfo>,
-    fetched_at: Instant,
+    idle: Option<JoinHandle<()>>,
+    candle_resync: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
 struct AppState {
     markets: Arc<RwLock<HashMap<Market, MarketState>>>,
     workers: Arc<Mutex<HashMap<Market, Worker>>>,
-    catalogs: Arc<RwLock<HashMap<(Exchange, MarketKind), CatalogEntry>>>,
-    http: reqwest::Client,
-    updates: broadcast::Sender<ServerMessage>,
+    catalogs: Arc<catalog_cache::Cache>,
+    http: http::Client,
+    updates: broadcast::Sender<Arc<ServerMessage>>,
+    lagged_messages: Arc<AtomicU64>,
     accounts: Arc<RwLock<HashMap<Account, AccountState>>>,
     account_fills: Arc<RwLock<HashMap<Account, Vec<OwnFill>>>>,
     account_users: Arc<Mutex<HashMap<Account, usize>>>,
     account_control: watch::Sender<Vec<Account>>,
+    hyperliquid_control: watch::Sender<Vec<Market>>,
 }
 
 impl AppState {
+    fn publish(
+        &self,
+        message: ServerMessage,
+    ) -> Result<usize, broadcast::error::SendError<Arc<ServerMessage>>> {
+        self.updates.send(Arc::new(message))
+    }
+
     async fn acquire_account(&self, account: Account) {
         let mut users = self.account_users.lock().await;
         *users.entry(account).or_default() += 1;
@@ -148,7 +159,7 @@ impl AppState {
             .write()
             .await
             .insert(account.clone(), state.clone());
-        let _ = self.updates.send(ServerMessage::AccountState {
+        let _ = self.publish(ServerMessage::AccountState {
             account: account.clone(),
             state,
         });
@@ -184,7 +195,7 @@ impl AppState {
         };
         drop(histories);
         if snapshot || !fills.is_empty() {
-            let _ = self.updates.send(ServerMessage::AccountFills {
+            let _ = self.publish(ServerMessage::AccountFills {
                 account: account.clone(),
                 fills,
                 snapshot,
@@ -197,13 +208,19 @@ impl AppState {
         let mut workers = self.workers.lock().await;
         if let Some(worker) = workers.get_mut(&market) {
             worker.users += 1;
+            if let Some(idle) = worker.idle.take() {
+                idle.abort();
+            }
             return;
         }
-        let books = tokio::spawn(exchange::run_books(market.clone(), self.clone()));
+        let candle_resync = Arc::new(tokio::sync::Notify::new());
+        let books = (market.exchange != Exchange::Hyperliquid)
+            .then(|| tokio::spawn(exchange::run_books(market.clone(), self.clone())));
         let candles = tokio::spawn(exchange::run_candles(
             market.clone(),
             self.clone(),
             self.http.clone(),
+            candle_resync.clone(),
         ));
         workers.insert(
             market,
@@ -211,7 +228,16 @@ impl AppState {
                 users: 1,
                 books,
                 candles,
+                idle: None,
+                candle_resync,
             },
+        );
+        self.hyperliquid_control.send_replace(
+            workers
+                .keys()
+                .filter(|market| market.exchange == Exchange::Hyperliquid)
+                .cloned()
+                .collect(),
         );
     }
 
@@ -224,11 +250,29 @@ impl AppState {
             worker.users -= 1;
             return;
         }
-        if let Some(worker) = workers.remove(market) {
-            worker.books.abort();
-            worker.candles.abort();
-            self.markets.write().await.remove(market);
-        }
+        worker.users = 0;
+        let state = self.clone();
+        let market = market.clone();
+        worker.idle = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut workers = state.workers.lock().await;
+            if workers.get(&market).is_some_and(|worker| worker.users == 0)
+                && let Some(worker) = workers.remove(&market)
+            {
+                if let Some(books) = worker.books {
+                    books.abort();
+                }
+                worker.candles.abort();
+                state.markets.write().await.remove(&market);
+                state.hyperliquid_control.send_replace(
+                    workers
+                        .keys()
+                        .filter(|market| market.exchange == Exchange::Hyperliquid)
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }));
     }
 
     async fn symbols(
@@ -236,28 +280,13 @@ impl AppState {
         exchange: Exchange,
         kind: MarketKind,
     ) -> Result<Vec<SymbolInfo>, String> {
-        let key = (exchange, kind);
-        let previous = self.catalogs.read().await.get(&key).cloned();
-        if let Some(entry) = &previous
-            && entry.fetched_at.elapsed() < Duration::from_secs(15 * 60)
-        {
-            return Ok(entry.symbols.clone());
-        }
-        match catalog::fetch(exchange, kind, &self.http).await {
-            Ok(symbols) => {
-                self.catalogs.write().await.insert(
-                    key,
-                    CatalogEntry {
-                        symbols: symbols.clone(),
-                        fetched_at: Instant::now(),
-                    },
-                );
-                Ok(symbols)
-            }
-            Err(error) => {
-                previous.map_or_else(|| Err(error.to_string()), |entry| Ok(entry.symbols))
-            }
-        }
+        self.catalogs
+            .get_or_fetch((exchange, kind), || async {
+                catalog::fetch(exchange, kind, &self.http)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
     }
 
     async fn snapshot(&self, market: &Market) -> ServerMessage {
@@ -284,14 +313,18 @@ impl AppState {
         state.book = Some(book.clone());
         let became_connected = !state.connected;
         state.connected = true;
+        let resync = std::mem::take(&mut state.needs_candle_resync);
         drop(markets);
+        if resync {
+            self.request_candle_resync(market).await;
+        }
         if became_connected {
-            let _ = self.updates.send(ServerMessage::Status {
+            let _ = self.publish(ServerMessage::Status {
                 market: market.clone(),
                 connected: true,
             });
         }
-        let _ = self.updates.send(ServerMessage::Book {
+        let _ = self.publish(ServerMessage::Book {
             market: market.clone(),
             book,
         });
@@ -311,7 +344,7 @@ impl AppState {
             .entry(market.clone())
             .or_default()
             .book = Some(book);
-        let _ = self.updates.send(ServerMessage::BookDelta {
+        let _ = self.publish(ServerMessage::BookDelta {
             market: market.clone(),
             bids,
             asks,
@@ -332,14 +365,18 @@ impl AppState {
         state.best_bid_ask = Some(quote.clone());
         let became_connected = !state.connected;
         state.connected = true;
+        let resync = std::mem::take(&mut state.needs_candle_resync);
         drop(markets);
+        if resync {
+            self.request_candle_resync(market).await;
+        }
         if became_connected {
-            let _ = self.updates.send(ServerMessage::Status {
+            let _ = self.publish(ServerMessage::Status {
                 market: market.clone(),
                 connected: true,
             });
         }
-        let _ = self.updates.send(ServerMessage::BestBidAsk {
+        let _ = self.publish(ServerMessage::BestBidAsk {
             market: market.clone(),
             quote,
         });
@@ -371,25 +408,32 @@ impl AppState {
         }
         drop(markets);
         if let Some(candle) = live_candle {
-            let _ = self.updates.send(ServerMessage::Candle {
+            let _ = self.publish(ServerMessage::Candle {
                 market: market.clone(),
                 candle,
             });
         }
-        let _ = self.updates.send(ServerMessage::Trades {
+        let _ = self.publish(ServerMessage::Trades {
             market: market.clone(),
             trades,
         });
+    }
+
+    async fn request_candle_resync(&self, market: &Market) {
+        if let Some(worker) = self.workers.lock().await.get(market) {
+            worker.candle_resync.notify_one();
+        }
     }
 
     async fn disconnected(&self, market: &Market) {
         let mut markets = self.markets.write().await;
         let state = markets.entry(market.clone()).or_default();
         state.connected = false;
+        state.needs_candle_resync = true;
         state.book = None;
         state.best_bid_ask = None;
         drop(markets);
-        let _ = self.updates.send(ServerMessage::Status {
+        let _ = self.publish(ServerMessage::Status {
             market: market.clone(),
             connected: false,
         });
@@ -424,6 +468,16 @@ impl AppState {
                 _ => {}
             }
         }
+        // Incremental REST reconciliation replaces its overlapping tail only.
+        let first = candles[0].time;
+        let mut history: Vec<_> = state
+            .candles
+            .iter()
+            .take_while(|c| c.time < first)
+            .cloned()
+            .collect();
+        history.append(&mut candles);
+        candles = history;
         if candles.len() > 300 {
             candles.drain(..candles.len() - 300);
         }
@@ -446,9 +500,9 @@ impl AppState {
         });
         drop(markets);
         if let Some(snapshot) = snapshot {
-            let _ = self.updates.send(snapshot);
+            let _ = self.publish(snapshot);
         } else if changed {
-            let _ = self.updates.send(ServerMessage::Candle {
+            let _ = self.publish(ServerMessage::Candle {
                 market: market.clone(),
                 candle: latest,
             });
@@ -532,12 +586,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             },
             event = updates.recv(), if !selected.is_empty() || !selected_accounts.is_empty() => match event {
                 Ok(event) if event.market().is_some_and(|market| selected.contains(market))
-                    || matches!(&event, ServerMessage::AccountState { account, .. } | ServerMessage::AccountFills { account, .. } | ServerMessage::AccountPosition { account, .. } if selected_accounts.contains(account)) => {
+                    || matches!(event.as_ref(), ServerMessage::AccountState { account, .. } | ServerMessage::AccountFills { account, .. } | ServerMessage::AccountPosition { account, .. } if selected_accounts.contains(account)) => {
                     if send(&mut socket, &event).await.is_err() {
                         break 'connection;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    state.lagged_messages.fetch_add(missed, Ordering::Relaxed);
                     for market in &selected {
                         if send(&mut socket, &state.snapshot(market).await).await.is_err() {
                             break 'connection;
@@ -567,30 +622,42 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (updates, _) = broadcast::channel(512);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    // Arc payloads let a bounded ring absorb bursts without cloning deep books.
+    let (updates, _) = broadcast::channel(4096);
+    let http = http::Client::new();
     let (account_control, account_rx) = watch::channel(Vec::new());
+    let (hyperliquid_control, hyperliquid_rx) = watch::channel(Vec::new());
     let state = AppState {
         markets: Arc::default(),
         workers: Arc::default(),
         catalogs: Arc::default(),
         http,
         updates,
+        lagged_messages: Arc::default(),
         accounts: Arc::default(),
         account_fills: Arc::default(),
         account_users: Arc::default(),
         account_control,
+        hyperliquid_control,
     };
     tokio::spawn(accounts::run(state.clone(), account_rx));
+    tokio::spawn(exchange::hyperliquid::run(state.clone(), hyperliquid_rx));
 
     let dist = std::env::var("TERMINAL_WEB_DIST").unwrap_or_else(|_| "crates/web/dist".to_owned());
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", any(ws_handler))
-        .fallback_service(ServeDir::new(dist))
-        .with_state(state);
+        .fallback_service(ServeDir::new(dist));
+    if std::env::var("TERMINAL_METRICS").as_deref() == Ok("1") {
+        app = app.route(
+            "/diagnostics/http",
+            get(|State(state): State<AppState>| async move { axum::Json(state.http.metrics()) }),
+        );
+        app = app.route("/diagnostics/feeds", get(|State(state): State<AppState>| async move {
+            axum::Json(serde_json::json!({"lagged_messages": state.lagged_messages.load(Ordering::Relaxed)}))
+        }));
+    }
+    let app = app.with_state(state);
     let address: SocketAddr = std::env::var("BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
         .parse()?;
@@ -605,19 +672,22 @@ mod tests {
     use super::*;
     use terminal_core::TradeSide;
 
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         let (updates, _) = broadcast::channel(16);
         let (account_control, _) = watch::channel(Vec::new());
+        let (hyperliquid_control, _) = watch::channel(Vec::new());
         AppState {
             markets: Arc::default(),
             workers: Arc::default(),
             catalogs: Arc::default(),
-            http: reqwest::Client::new(),
+            http: http::Client::new(),
             updates,
+            lagged_messages: Arc::default(),
             accounts: Arc::default(),
             account_fills: Arc::default(),
             account_users: Arc::default(),
             account_control,
+            hyperliquid_control,
         }
     }
 
@@ -647,7 +717,7 @@ mod tests {
             .await;
         assert_eq!(added, vec![fill.clone()]);
         assert!(
-            matches!(events.recv().await.unwrap(), ServerMessage::AccountFills { fills, snapshot: false, .. } if fills.len() == 1)
+            matches!(events.recv().await.unwrap().as_ref(), ServerMessage::AccountFills { fills, snapshot: false, .. } if fills.len() == 1)
         );
         let added = state
             .publish_fills(&account, vec![fill.clone()], false)
@@ -706,7 +776,7 @@ mod tests {
         assert_eq!(candles.last().unwrap().high, 102.0);
         assert_eq!(candles.last().unwrap().volume, 12.0);
         assert!(matches!(
-            events.try_recv(),
+            events.try_recv().as_deref(),
             Ok(ServerMessage::Candle { .. })
         ));
     }
@@ -800,7 +870,7 @@ mod tests {
         assert_eq!(candles.last().unwrap().time, 180);
         assert_eq!(candles.last().unwrap().close, 103.0);
         assert_eq!(candles.last().unwrap().high, 103.0);
-        assert_eq!(candles[0].volume, 12.0);
+        assert_eq!(candles.iter().find(|c| c.time == 120).unwrap().volume, 12.0);
 
         state
             .publish_candles(
@@ -821,5 +891,99 @@ mod tests {
         };
         assert_eq!(candles.last().unwrap().close, 104.0);
         assert_eq!(candles.last().unwrap().volume, 8.0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn fast_workspace_return_reuses_live_worker_then_idle_cleanup_stops_it() {
+        let state = test_state();
+        let market = Market::default();
+        let books = tokio::spawn(std::future::pending());
+        let book_abort = books.abort_handle();
+        let candles = tokio::spawn(std::future::pending());
+        let candle_abort = candles.abort_handle();
+        state.workers.lock().await.insert(
+            market.clone(),
+            Worker {
+                users: 1,
+                books: Some(books),
+                candles,
+                idle: None,
+                candle_resync: Arc::default(),
+            },
+        );
+        state
+            .markets
+            .write()
+            .await
+            .insert(market.clone(), MarketState::default());
+        state.release(&market).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        state.acquire(market.clone()).await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(!book_abort.is_finished());
+        assert!(!candle_abort.is_finished());
+        assert_eq!(state.workers.lock().await.get(&market).unwrap().users, 1);
+        state.release(&market).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(state.workers.lock().await.is_empty());
+        assert!(state.markets.read().await.is_empty());
+        assert!(book_abort.is_finished());
+        assert!(candle_abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn short_rest_tail_preserves_history_and_reconnect_requests_reconciliation() {
+        let state = test_state();
+        let market = Market::default();
+        let candle = |time, close| Candle {
+            time,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+        };
+        state
+            .publish_candles(
+                &market,
+                (0..300).map(|i| candle(i * 60, 100.0)).collect(),
+                0,
+            )
+            .await;
+        state
+            .publish_candles(
+                &market,
+                vec![
+                    candle(298 * 60, 101.0),
+                    candle(299 * 60, 102.0),
+                    candle(300 * 60, 103.0),
+                ],
+                300 * 60_000,
+            )
+            .await;
+        let ServerMessage::Snapshot { candles, .. } = state.snapshot(&market).await else {
+            panic!()
+        };
+        assert_eq!(candles.len(), 300);
+        assert_eq!(candles[0].time, 60);
+        assert_eq!(candles[297].close, 101.0);
+        assert_eq!(candles[299].close, 103.0);
+        state.disconnected(&market).await;
+        assert!(state.markets.read().await[&market].needs_candle_resync);
+        state
+            .publish_best_bid_ask(
+                &market,
+                BestBidAsk {
+                    bid: "100".into(),
+                    ask: "101".into(),
+                    time_ms: 1,
+                },
+            )
+            .await;
+        assert!(!state.markets.read().await[&market].needs_candle_resync);
     }
 }

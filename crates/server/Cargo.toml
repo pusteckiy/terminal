@@ -15,3 +15,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal = "1"
 tower-http = { version = "0.6", features = ["fs"] }
+httpdate = "1" # Already transitive; parse standard HTTP-date Retry-After values.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

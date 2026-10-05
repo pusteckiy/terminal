@@ -44,7 +44,7 @@ Open **http://127.0.0.1:3000**. Run `cargo test --workspace` to check the projec
 
 Perp support covers linear contracts: Binance USDⓈ-M, OKX linear swaps, Bybit linear, Gate USDT, Hyperliquid, Lighter, Bitget USDT, Aster, Bitunix USDT, KuCoin linear, Kraken `PF_*`, and Pacifica. Inverse contracts are not included. Binance and Aster Perp publish aggregate trade events, so their tapes show each published aggregate rather than every underlying execution. Bitunix Spot currently provides a polled public order book and candle history; its public API does not expose a trade stream, so its trade tape and Last Trades comparison are unavailable. Order books contain the price levels available from each exchange's public feed; they do not expose individual orders. The terminal displays public market data and does not place trades.
 
-KuCoin uses its public UTA feed with 500 levels per side and up to 10 ms book updates. Kraken Spot provides 1,000 levels with checksum validation; its linear Perp feed supplies a snapshot and sequenced updates. Pacifica supports both Spot and Perp, with a dedicated event-driven BBO feed for PRICES. See [API notes](docs/exchanges/kucoin-kraken-pacifica.md) for source documentation and depth limits.
+KuCoin uses its public UTA feed with 500 levels per side and up to 10 ms book updates. Kraken Spot provides 1,000 levels with checksum validation; its linear Perp feed supplies a snapshot and sequenced updates. Pacifica supports both Spot and Perp, with a dedicated event-driven BBO feed for PRICES.
 
 ## Project
 

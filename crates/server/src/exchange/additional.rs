@@ -19,7 +19,7 @@ fn text(value: &Value) -> Option<String> {
 pub(crate) async fn catalog(
     exchange: Exchange,
     kind: MarketKind,
-    client: &reqwest::Client,
+    client: &crate::http::Client,
 ) -> Result<Vec<SymbolInfo>, Error> {
     let url = match (exchange, kind) {
         (Exchange::Kucoin, MarketKind::Spot) => "https://api.kucoin.com/api/v2/symbols",
@@ -166,9 +166,13 @@ async fn multiplier(market: &Market, state: &AppState) -> Result<Decimal, Error>
         .ok_or_else(|| "missing KuCoin contract multiplier".into())
 }
 
-pub(crate) async fn candles(market: &Market, state: &AppState) -> Result<Vec<Candle>, Error> {
+pub(crate) async fn candles(
+    market: &Market,
+    state: &AppState,
+    count: usize,
+) -> Result<Vec<Candle>, Error> {
     let end = now_ms();
-    let start = end - 300 * 60_000;
+    let start = end - count as i64 * 60_000;
     let symbol = market.symbol.as_str();
     let client = &state.http;
     let request = match (market.exchange, market.kind) {
@@ -208,7 +212,7 @@ pub(crate) async fn candles(market: &Market, state: &AppState) -> Result<Vec<Can
             ("interval", "1m".into()),
             ("start_time", start.to_string()),
             ("end_time", end.to_string()),
-            ("limit", "300".into()),
+            ("limit", count.to_string()),
         ]),
         _ => unreachable!(),
     };
@@ -517,7 +521,7 @@ pub(crate) async fn stream(market: &Market, state: &AppState) -> Result<(), Erro
         (Exchange::Pacifica, _) => "wss://ws.pacifica.fi/ws",
         _ => unreachable!(),
     };
-    let (mut socket, _) = connect_async(url).await?;
+    let (mut socket, _) = connect_public(url).await?;
     for channel in ["book", "trade"] {
         let subscription = match (market.exchange, market.kind) {
             (Exchange::Kraken, MarketKind::Spot) => {
@@ -633,8 +637,8 @@ async fn kucoin(market: &Market, state: &AppState) -> Result<(), Error> {
     } else {
         "wss://x-push-futures.kucoin.com"
     };
-    let (mut socket, _) = connect_async(url).await?;
-    let scale = multiplier(market, state).await?;
+    let ((mut socket, _), scale) =
+        tokio::try_join!(connect_public(url), multiplier(market, state))?;
     let welcome = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(message) = socket.next().await {
             let value: Value = match message? {

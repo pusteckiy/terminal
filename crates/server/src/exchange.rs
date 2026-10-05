@@ -18,8 +18,23 @@ use tokio_tungstenite::{
 use crate::AppState;
 
 pub(crate) mod additional;
+pub(crate) mod hyperliquid;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+async fn connect_public<R: IntoClientRequest + Unpin>(
+    request: R,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    Error,
+> {
+    Ok(tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await??)
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -438,13 +453,10 @@ fn changed_levels(
         .collect()
 }
 
-fn spawn_deep_snapshot(
-    market: &Market,
-    state: &AppState,
-) -> tokio::task::JoinHandle<Result<Value, String>> {
+fn spawn_deep_snapshot(market: &Market, state: &AppState) -> SnapshotTask {
     let client = state.http.clone();
     let market = market.clone();
-    tokio::spawn(async move {
+    SnapshotTask(tokio::spawn(async move {
         let response = match market.exchange {
             Exchange::Binance | Exchange::Aster => {
                 client
@@ -505,7 +517,23 @@ fn spawn_deep_snapshot(
             .json::<Value>()
             .await
             .map_err(|error| error.to_string())
-    })
+    }))
+}
+
+struct SnapshotTask(tokio::task::JoinHandle<Result<Value, String>>);
+impl std::future::Future for SnapshotTask {
+    type Output = Result<Result<Value, String>, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+impl Drop for SnapshotTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn deep_update_ids(exchange: Exchange, value: &Value) -> Option<(i64, i64)> {
@@ -679,8 +707,54 @@ fn apply_gate_obu(data: &Value, book: &mut BookAccumulator) -> Result<bool, Erro
     Ok(changed)
 }
 
+fn apply_bitget_book(value: &Value, book: &mut BookAccumulator) -> Result<bool, Error> {
+    if value["arg"]["channel"] != "books" || value["event"] == "subscribe" {
+        return Ok(false);
+    }
+    let Some(data) = value["data"].as_array().and_then(|rows| rows.first()) else {
+        return Ok(false);
+    };
+    let seq = integer(&data["seq"]).ok_or("Bitget book lacks sequence ID")?;
+    if value["action"] == "snapshot" {
+        if !book.replace(&data["bids"], &data["asks"], Some(seq)) || book.is_crossed() {
+            return Err("invalid Bitget snapshot".into());
+        }
+        return Ok(true);
+    }
+    if value["action"] != "update" || !book.ready {
+        return Ok(false);
+    }
+    if book.sequence != integer(&data["pseq"]) {
+        return Err("Bitget book sequence gap".into());
+    }
+    if !book.update(&data["bids"], &data["asks"]) || book.is_crossed() {
+        return Err("invalid Bitget delta".into());
+    }
+    book.sequence = Some(seq);
+    Ok(true)
+}
+
+// A futures REST ID can lie between sparse stream IDs. Wait for the first
+// forward event before publishing; checking `pu` against the REST ID is invalid.
+fn snapshot_ahead_of_stream(
+    exchange: Exchange,
+    kind: MarketKind,
+    snapshot: &Value,
+    buffered: &VecDeque<Value>,
+) -> bool {
+    matches!(exchange, Exchange::Aster | Exchange::Binance)
+        && kind == MarketKind::Perp
+        && integer(&snapshot["lastUpdateId"]).is_some_and(|id| {
+            !buffered
+                .iter()
+                .any(|event| deep_update_ids(exchange, event).is_some_and(|(_, last)| last > id))
+        })
+}
+
 pub async fn run_books(market: Market, state: AppState) {
+    let mut failures = 0_u32;
     loop {
+        let started = std::time::Instant::now();
         let result = if market.exchange == Exchange::Bitunix && market.kind == MarketKind::Spot {
             poll_bitunix_spot_book(&market, &state).await
         } else if market.exchange == Exchange::Binance && market.kind == MarketKind::Perp {
@@ -699,7 +773,12 @@ pub async fn run_books(market: Market, state: AppState) {
             );
         }
         state.disconnected(&market).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        failures = if started.elapsed() > Duration::from_secs(30) {
+            1
+        } else {
+            failures.saturating_add(1)
+        };
+        tokio::time::sleep(Duration::from_secs(2_u64.pow(failures.min(5)).min(30))).await;
     }
 }
 
@@ -751,7 +830,7 @@ async fn run_binance_perp_trades(market: &Market, state: &AppState) {
     let url = format!("wss://fstream.binance.com/market/stream?streams={symbol}@aggTrade");
     loop {
         let result: Result<(), Error> = async {
-            let (mut socket, _) = connect_async(&url).await?;
+            let (mut socket, _) = connect_public(&url).await?;
             while let Some(frame) = socket.next().await {
                 match frame? {
                     Message::Text(text) => {
@@ -776,17 +855,24 @@ async fn run_binance_perp_trades(market: &Market, state: &AppState) {
     }
 }
 
+fn public_heartbeat(exchange: Exchange, time_ms: i64) -> Message {
+    match exchange {
+        Exchange::Bitunix => Message::Text(
+            json!({"op":"ping","ping":time_ms / 1000})
+                .to_string()
+                .into(),
+        ),
+        Exchange::Bitget | Exchange::Okx => Message::Text("ping".into()),
+        Exchange::Bybit => Message::Text(json!({"op":"ping"}).to_string().into()),
+        _ => Message::Ping(Vec::new().into()),
+    }
+}
+
 async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
     if additional::handles(market.exchange) {
         return additional::stream(market, state).await;
     }
     let symbol = market.symbol.as_str();
-    let multiplier = base_size_multiplier(market, state).await?;
-    let lighter_id = if market.exchange == Exchange::Lighter {
-        Some(lighter_market_id(market, state).await?)
-    } else {
-        None
-    };
     let url = match market.exchange {
         Exchange::Binance | Exchange::Aster => {
             if market.kind == MarketKind::Spot {
@@ -843,7 +929,17 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
             .headers_mut()
             .insert("X-Gate-Size-Decimal", HeaderValue::from_static("1"));
     }
-    let (mut socket, _) = connect_async(request).await?;
+    // Contract metadata is needed before decoding sizes, not before TCP/TLS setup.
+    let ((mut socket, _), (multiplier, lighter_id)) =
+        tokio::try_join!(connect_public(request), async {
+            let multiplier = base_size_multiplier(market, state).await?;
+            let lighter_id = if market.exchange == Exchange::Lighter {
+                Some(lighter_market_id(market, state).await?)
+            } else {
+                None
+            };
+            Ok::<_, Error>((multiplier, lighter_id))
+        })?;
     let subscriptions = match market.exchange {
         Exchange::Binance | Exchange::Aster => vec![],
         Exchange::Okx => vec![json!({"op":"subscribe","args":[
@@ -920,8 +1016,10 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
     }
     let mut book = BookAccumulator::default();
     let mut buffered = VecDeque::<Value>::new();
-    let mut snapshot_task: Option<tokio::task::JoinHandle<Result<Value, String>>> = None;
-    let mut keepalive = tokio::time::interval(Duration::from_secs(60));
+    let mut snapshot_task: Option<SnapshotTask> = None;
+    let mut pending_snapshot: Option<Value> = None;
+    let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await;
     loop {
         let frame = tokio::select! {
@@ -930,7 +1028,9 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                 snapshot_task = None;
                 let snapshot = result.map_err(std::io::Error::other)?
                     .map_err(std::io::Error::other)?;
-                if initialize_deep_book(market.exchange, market.kind, &snapshot, &mut buffered, &mut book)? {
+                if snapshot_ahead_of_stream(market.exchange, market.kind, &snapshot, &buffered) {
+                    pending_snapshot = Some(snapshot);
+                } else if initialize_deep_book(market.exchange, market.kind, &snapshot, &mut buffered, &mut book)? {
                     state.publish_book(market, book.book(now_ms())).await;
                 } else {
                     snapshot_task = Some(spawn_deep_snapshot(market, state));
@@ -938,13 +1038,16 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                 continue;
             }
             _ = keepalive.tick() => {
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                socket.send(public_heartbeat(market.exchange, now_ms())).await?;
                 continue;
             }
         };
         let Some(frame) = frame else { break };
         match frame? {
             Message::Text(text) => {
+                if matches!(market.exchange, Exchange::Bitget | Exchange::Okx) && text == "pong" {
+                    continue;
+                }
                 let envelope: Value = serde_json::from_str(&text)?;
                 let value = if matches!(market.exchange, Exchange::Binance | Exchange::Aster) {
                     &envelope["data"]
@@ -990,7 +1093,26 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                         return Err(std::io::Error::other("book snapshot buffer overflow").into());
                     }
                     buffered.push_back(value.clone());
-                    if snapshot_task.is_none() {
+                    if let Some(snapshot) = pending_snapshot.take() {
+                        if snapshot_ahead_of_stream(
+                            market.exchange,
+                            market.kind,
+                            &snapshot,
+                            &buffered,
+                        ) {
+                            pending_snapshot = Some(snapshot);
+                        } else if initialize_deep_book(
+                            market.exchange,
+                            market.kind,
+                            &snapshot,
+                            &mut buffered,
+                            &mut book,
+                        )? {
+                            state.publish_book(market, book.book(now_ms())).await;
+                        } else {
+                            snapshot_task = Some(spawn_deep_snapshot(market, state));
+                        }
+                    } else if snapshot_task.is_none() {
                         snapshot_task = Some(spawn_deep_snapshot(market, state));
                     }
                     continue;
@@ -1104,31 +1226,12 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                         }
                     }
                     Exchange::Bitget => {
-                        if value["arg"]["channel"] != "books" {
-                            false
-                        } else {
-                            let data = &value["data"][0];
-                            let seq = integer(&data["seq"]).ok_or_else(|| {
-                                std::io::Error::other("Bitget book lacks sequence ID")
-                            })?;
-                            if value["action"] == "snapshot" {
-                                book.replace(&data["bids"], &data["asks"], Some(seq))
-                            } else if value["action"] == "update" {
-                                if book.ready && book.sequence != integer(&data["pseq"]) {
-                                    return Err(
-                                        std::io::Error::other("Bitget book sequence gap").into()
-                                    );
-                                }
-                                let updated = book.update(&data["bids"], &data["asks"]);
-                                if updated {
-                                    book.sequence = Some(seq);
-                                    delta_rows = Some((&data["bids"], &data["asks"]));
-                                }
-                                updated
-                            } else {
-                                false
-                            }
+                        let updated = apply_bitget_book(value, &mut book)?;
+                        if updated && value["action"] == "update" {
+                            delta_rows =
+                                Some((&value["data"][0]["bids"], &value["data"][0]["asks"]));
                         }
+                        updated
                     }
                     Exchange::Bitunix => {
                         if value["ch"] == "depth_books" {
@@ -1189,34 +1292,63 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn run_candles(market: Market, state: AppState, client: reqwest::Client) {
+pub async fn run_candles(
+    market: Market,
+    state: AppState,
+    client: crate::http::Client,
+    resync: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let mut initialized = false;
+    let mut failures = 0_u32;
     loop {
         let requested_at_ms = now_ms();
-        match fetch_candles(&market, &state, &client).await {
-            Ok(candles) => {
+        let count = if initialized { 3 } else { 300 };
+        match fetch_candles(&market, &state, &client, count).await {
+            Ok(candles) if !candles.is_empty() => {
                 state
                     .publish_candles(&market, candles, requested_at_ms)
-                    .await
+                    .await;
+                initialized = true;
+                failures = 0;
             }
-            Err(error) => eprintln!(
-                "{} {} candles: {error}",
-                market.exchange.label(),
-                market.symbol
-            ),
+            result => {
+                failures = failures.saturating_add(1);
+                if let Err(error) = result {
+                    eprintln!(
+                        "{} {} candles: {error}",
+                        market.exchange.label(),
+                        market.symbol
+                    );
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let delay = if failures > 0 {
+            (5 * 2_u64.pow(failures.min(4) - 1)).min(60)
+        }
+        // Bitunix Spot has no trade stream in this adapter: retain its fallback.
+        else if market.exchange == Exchange::Bitunix && market.kind == MarketKind::Spot {
+            5
+        } else {
+            60
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+            _ = resync.notified() => { initialized = false; }
+        }
     }
 }
 
 async fn fetch_candles(
     market: &Market,
     state: &AppState,
-    client: &reqwest::Client,
+    client: &crate::http::Client,
+    count: usize,
 ) -> Result<Vec<Candle>, Error> {
     if additional::handles(market.exchange) {
-        return additional::candles(market, state).await;
+        return additional::candles(market, state, count).await;
     }
     let symbol = market.symbol.as_str();
+    let count_text = count.to_string();
     let multiplier = base_size_multiplier(market, state)
         .await?
         .to_f64()
@@ -1239,7 +1371,11 @@ async fn fetch_candles(
                     }
                     _ => unreachable!(),
                 })
-                .query(&[("symbol", symbol), ("interval", "1m"), ("limit", "300")])
+                .query(&[
+                    ("symbol", symbol),
+                    ("interval", "1m"),
+                    ("limit", count_text.as_str()),
+                ])
                 .send()
                 .await?
                 .error_for_status()?
@@ -1249,7 +1385,11 @@ async fn fetch_candles(
         Exchange::Okx => {
             client
                 .get("https://www.okx.com/api/v5/market/candles")
-                .query(&[("instId", symbol), ("bar", "1m"), ("limit", "300")])
+                .query(&[
+                    ("instId", symbol),
+                    ("bar", "1m"),
+                    ("limit", count_text.as_str()),
+                ])
                 .send()
                 .await?
                 .error_for_status()?
@@ -1270,7 +1410,7 @@ async fn fetch_candles(
                     ),
                     ("symbol", symbol),
                     ("interval", "1"),
-                    ("limit", "300"),
+                    ("limit", count_text.as_str()),
                 ])
                 .send()
                 .await?
@@ -1282,7 +1422,7 @@ async fn fetch_candles(
             client
                 .post("https://api.hyperliquid.xyz/info")
                 .json(&json!({"type":"candleSnapshot","req":{
-                    "coin":symbol,"interval":"1m","startTime":now_ms()-300*60_000,
+                    "coin":symbol,"interval":"1m","startTime":now_ms()-count as i64*60_000,
                     "endTime":now_ms()
                 }}))
                 .send()
@@ -1308,7 +1448,7 @@ async fn fetch_candles(
                         symbol,
                     ),
                     ("interval", "1m"),
-                    ("limit", "300"),
+                    ("limit", count_text.as_str()),
                 ])
                 .send()
                 .await?
@@ -1324,9 +1464,9 @@ async fn fetch_candles(
                 .query(&[
                     ("market_id", market_id.to_string()),
                     ("resolution", "1m".to_owned()),
-                    ("start_timestamp", (end - 300 * 60).to_string()),
+                    ("start_timestamp", (end - count as i64 * 60).to_string()),
                     ("end_timestamp", end.to_string()),
-                    ("count_back", "300".to_owned()),
+                    ("count_back", count_text.clone()),
                 ])
                 .send()
                 .await?
@@ -1351,7 +1491,7 @@ async fn fetch_candles(
                             "1m"
                         },
                     ),
-                    ("limit", "300"),
+                    ("limit", count_text.as_str()),
                 ]);
             let request = if market.kind == MarketKind::Perp {
                 request.query(&[("productType", "usdt-futures")])
@@ -1380,9 +1520,9 @@ async fn fetch_candles(
                     (
                         "limit",
                         if market.kind == MarketKind::Spot {
-                            "300"
+                            count_text.as_str()
                         } else {
-                            "200"
+                            if count < 200 { "3" } else { "200" }
                         },
                     ),
                 ])
@@ -1503,6 +1643,18 @@ fn parse_utc_seconds(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_heartbeats_use_venue_protocols() {
+        let Message::Text(bitunix) = public_heartbeat(Exchange::Bitunix, 1732519687123) else {
+            panic!("Bitunix requires a JSON text heartbeat");
+        };
+        let value: Value = serde_json::from_str(&bitunix).unwrap();
+        assert_eq!(value, json!({"op":"ping","ping":1732519687}));
+        for exchange in [Exchange::Bitget, Exchange::Okx] {
+            assert_eq!(public_heartbeat(exchange, 0), Message::Text("ping".into()));
+        }
+    }
 
     #[test]
     fn new_venue_trade_and_candle_formats() {
@@ -1953,5 +2105,60 @@ mod tests {
             &json!([{"price":"102","size":"1"}])
         ));
         assert!(book.book(1).bids.is_empty());
+    }
+    #[test]
+    fn bitget_subscription_ack_does_not_abort_before_snapshot() {
+        let mut book = BookAccumulator::default();
+        let ack = json!({"event":"subscribe","arg":{"channel":"books","instId":"BTCUSDT"}});
+        assert!(!apply_bitget_book(&ack, &mut book).unwrap());
+        let snapshot = json!({"action":"snapshot","arg":{"channel":"books"},"data":[{"seq":100,"pseq":0,"bids":[["100","2"]],"asks":[["101","3"]]}]});
+        assert!(apply_bitget_book(&snapshot, &mut book).unwrap());
+        let delta = json!({"action":"update","arg":{"channel":"books"},"data":[{"seq":120,"pseq":100,"bids":[["100","1"]],"asks":[]}]});
+        assert!(apply_bitget_book(&delta, &mut book).unwrap());
+        assert_eq!(book.sequence, Some(120));
+        assert!(
+            apply_bitget_book(&delta, &mut book).is_err(),
+            "a real gap must still trigger recovery"
+        );
+    }
+
+    #[test]
+    fn aster_snapshot_between_sparse_events_waits_for_bridge() {
+        let snapshot = json!({"lastUpdateId":100,"bids":[["100","1"]],"asks":[["101","1"]]});
+        let mut buffered = VecDeque::from([json!({"U":90,"u":90,"pu":80,"b":[],"a":[]})]);
+        assert!(snapshot_ahead_of_stream(
+            Exchange::Aster,
+            MarketKind::Perp,
+            &snapshot,
+            &buffered
+        ));
+        buffered.push_back(json!({"U":110,"u":110,"pu":90,"b":[["100","2"]],"a":[]}));
+        assert!(!snapshot_ahead_of_stream(
+            Exchange::Aster,
+            MarketKind::Perp,
+            &snapshot,
+            &buffered
+        ));
+        let mut book = BookAccumulator::default();
+        assert!(
+            initialize_deep_book(
+                Exchange::Aster,
+                MarketKind::Perp,
+                &snapshot,
+                &mut buffered,
+                &mut book
+            )
+            .unwrap()
+        );
+        assert_eq!(book.sequence, Some(110));
+        assert!(
+            apply_deep_delta(
+                Exchange::Aster,
+                MarketKind::Perp,
+                &json!({"U":120,"u":120,"pu":110,"b":[],"a":[]}),
+                &mut book
+            )
+            .unwrap()
+        );
     }
 }
