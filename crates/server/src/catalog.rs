@@ -12,6 +12,21 @@ pub async fn fetch(
     if crate::exchange::additional::handles(exchange) {
         return crate::exchange::additional::catalog(exchange, kind, client).await;
     }
+    if exchange == Exchange::Hyperliquid && kind == MarketKind::Perp {
+        // One request covers the native DEX and every HIP-3 builder DEX.
+        let fetch = async |request_type| -> Result<Value, Error> {
+            Ok(client
+                .post("https://api.hyperliquid.xyz/info")
+                .json(&json!({"type": request_type}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        };
+        let (metas, spot) = tokio::try_join!(fetch("allPerpMetas"), fetch("spotMeta"))?;
+        return parse_hyperliquid_perps(&metas, &spot);
+    }
     let response: Value = match exchange {
         Exchange::Binance => {
             client
@@ -163,6 +178,53 @@ pub async fn fetch(
         symbols.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
         symbols.dedup_by(|a, b| a.symbol == b.symbol);
     }
+    Ok(symbols)
+}
+
+fn parse_hyperliquid_perps(metas: &Value, spot: &Value) -> Result<Vec<SymbolInfo>, Error> {
+    let metas = metas
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("invalid Hyperliquid perp metadata"))?;
+    let tokens = spot["tokens"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("invalid Hyperliquid collateral metadata"))?;
+    let mut symbols = Vec::new();
+    for meta in metas {
+        let rows = meta["universe"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("invalid Hyperliquid perp universe"))?;
+        let collateral = meta["collateralToken"]
+            .as_u64()
+            .ok_or_else(|| std::io::Error::other("missing Hyperliquid collateral token"))?;
+        let quote = tokens
+            .iter()
+            .find(|token| token["index"].as_u64() == Some(collateral))
+            .and_then(|token| token["name"].as_str())
+            .ok_or_else(|| std::io::Error::other("unknown Hyperliquid collateral token"))?;
+        for row in rows.iter().filter(|row| row["isDelisted"] != true) {
+            let symbol = row["name"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::other("missing Hyperliquid perp symbol"))?;
+            symbols.push(SymbolInfo {
+                // Preserve the exact API coin for subscriptions, history and accounts.
+                symbol: symbol.to_owned(),
+                base: symbol
+                    .split_once(':')
+                    .map_or(symbol, |(_, base)| base)
+                    .to_owned(),
+                quote: quote.to_owned(),
+                base_token_id: None,
+                market_id: None,
+                size_multiplier: None,
+                price_step: None,
+            });
+        }
+    }
+    if symbols.is_empty() {
+        return Err(std::io::Error::other("empty Hyperliquid perp catalog").into());
+    }
+    symbols.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
+    symbols.dedup_by(|a, b| a.symbol == b.symbol);
     Ok(symbols)
 }
 
@@ -361,6 +423,30 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyperliquid_catalog_includes_all_builder_dexes_without_merging_symbols() {
+        let metas = json!([
+            {"collateralToken":0,"universe":[{"name":"BTC"}]},
+            {"collateralToken":0,"universe":[{"name":"xyz:NVDA"},{"name":"xyz:SPCX"},{"name":"xyz:OLD","isDelisted":true}]},
+            {"collateralToken":360,"universe":[{"name":"flx:NVDA"}]},
+            {"collateralToken":0,"universe":[]}
+        ]);
+        let spot = json!({"tokens":[{"index":360,"name":"USDH"},{"index":0,"name":"USDC"}]});
+        let symbols = parse_hyperliquid_perps(&metas, &spot).unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|s| s.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTC", "flx:NVDA", "xyz:NVDA", "xyz:SPCX"]
+        );
+        assert_eq!(symbols[1].base, "NVDA");
+        assert_eq!(symbols[1].quote, "USDH");
+        assert_eq!(symbols[2].quote, "USDC");
+        assert!(parse_hyperliquid_perps(&json!({}), &spot).is_err());
+        assert!(parse_hyperliquid_perps(&metas, &json!({"tokens":[]})).is_err());
+    }
 
     #[test]
     fn new_venue_catalogs_select_active_spot_and_perpetual_symbols() {

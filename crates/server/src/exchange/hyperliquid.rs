@@ -177,17 +177,23 @@ mod tests {
         let mut spot = btc.clone();
         spot.kind = MarketKind::Spot;
         spot.symbol = "@1".into();
+        let mut xyz = btc.clone();
+        xyz.symbol = "xyz:NVDA".into();
+        let mut flx = btc.clone();
+        flx.symbol = "flx:NVDA".into();
         publish(
             &state,
-            &[btc.clone(), spot.clone()],
+            &[btc.clone(), spot.clone(), xyz.clone(), flx.clone()],
             &json!({"channel":"trades","data":[
                 {"coin":"BTC","px":"100","sz":"2","time":1000,"side":"B"},
-                {"coin":"@1","px":"0.5","sz":"3","time":1001,"side":"A"}
+                {"coin":"@1","px":"0.5","sz":"3","time":1001,"side":"A"},
+                {"coin":"xyz:NVDA","px":"180","sz":"1","time":1002,"side":"B"},
+                {"coin":"flx:NVDA","px":"181","sz":"4","time":1003,"side":"A"}
             ]}),
         )
         .await
         .unwrap();
-        for (market, price) in [(&btc, "100"), (&spot, "0.5")] {
+        for (market, price) in [(&btc, "100"), (&spot, "0.5"), (&xyz, "180"), (&flx, "181")] {
             assert!(
                 matches!(state.snapshot(market).await, terminal_core::ServerMessage::Snapshot {last_price: Some(last), ..} if last.price == price)
             );
