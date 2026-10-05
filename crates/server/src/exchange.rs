@@ -569,7 +569,8 @@ fn apply_deep_delta(
     {
         return Err(std::io::Error::other("depth stream sequence gap").into());
     }
-    if (exchange != Exchange::Aster && first > previous + 1)
+    // USD-M futures use pu to link events; their U ranges can skip IDs.
+    if (exchange == Exchange::Binance && kind == MarketKind::Spot && first > previous + 1)
         || (exchange == Exchange::Bybit && last != previous + 1)
     {
         return Err(std::io::Error::other("deep book sequence gap").into());
@@ -610,15 +611,20 @@ fn initialize_deep_book(
     if !candidate.replace(bids, asks, Some(id)) {
         return Err(std::io::Error::other("snapshot lacks book levels").into());
     }
-    if exchange == Exchange::Binance
-        && kind == MarketKind::Perp
-        && !buffered
+    let binance_perp = exchange == Exchange::Binance && kind == MarketKind::Perp;
+    if binance_perp {
+        // The first futures event must overlap lastUpdateId inclusively.
+        let Some((first, _)) = buffered
             .iter()
-            .any(|event| deep_update_ids(exchange, event).is_some_and(|(_, last)| last >= id))
-    {
-        return Ok(false);
-    }
-    if let Some(first_new) = buffered
+            .filter_map(|event| deep_update_ids(exchange, event))
+            .find(|(_, last)| *last >= id)
+        else {
+            return Ok(false);
+        };
+        if first > id {
+            return Ok(false);
+        }
+    } else if let Some(first_new) = buffered
         .iter()
         .find(|event| deep_update_ids(exchange, event).is_some_and(|(_, last)| last > id))
     {
@@ -627,9 +633,7 @@ fn initialize_deep_book(
             if integer(&first_new["pu"]).is_none_or(|previous| previous > id) {
                 return Ok(false);
             }
-        } else if first > id + 1
-            || (exchange == Exchange::Binance && kind == MarketKind::Perp && first > id)
-        {
+        } else if first > id + 1 {
             return Ok(false);
         }
     }
@@ -644,7 +648,7 @@ fn initialize_deep_book(
             let Some((_, last)) = deep_update_ids(exchange, event) else {
                 continue;
             };
-            if last <= id {
+            if last < id || (last == id && !binance_perp) {
                 continue;
             }
             let (bids, asks) = (&event["b"], &event["a"]);
@@ -745,9 +749,11 @@ fn snapshot_ahead_of_stream(
     matches!(exchange, Exchange::Aster | Exchange::Binance)
         && kind == MarketKind::Perp
         && integer(&snapshot["lastUpdateId"]).is_some_and(|id| {
-            !buffered
-                .iter()
-                .any(|event| deep_update_ids(exchange, event).is_some_and(|(_, last)| last > id))
+            !buffered.iter().any(|event| {
+                deep_update_ids(exchange, event).is_some_and(|(_, last)| {
+                    last > id || (exchange == Exchange::Binance && last == id)
+                })
+            })
         })
 }
 
@@ -1944,6 +1950,85 @@ mod tests {
             .unwrap()
         );
         assert_eq!(behind.len(), 1);
+    }
+
+    #[test]
+    fn binance_perpetual_continues_when_update_ranges_skip_ids_but_pu_matches() {
+        // Consecutive BCHUSDT depth events: U need not equal the previous u + 1.
+        let mut book = BookAccumulator::default();
+        assert!(book.replace(
+            &json!([["315.48", "2"]]),
+            &json!([["315.49", "2"]]),
+            Some(11739776192058),
+        ));
+        let next = json!({"U":11739776216783_i64,"u":11739776223087_i64,
+            "pu":11739776192058_i64,"b":[["315.48","3"]],"a":[]});
+        assert!(apply_deep_delta(Exchange::Binance, MarketKind::Spot, &next, &mut book).is_err());
+        assert_eq!(book.sequence, Some(11739776192058));
+        assert!(apply_deep_delta(Exchange::Binance, MarketKind::Perp, &next, &mut book).unwrap());
+        assert_eq!(book.sequence, Some(11739776223087));
+        assert_eq!(book.book(1).bids[0].size, "3");
+    }
+
+    #[test]
+    fn binance_perpetual_initializes_from_event_ending_at_snapshot_id() {
+        // The overlapping event can end exactly at lastUpdateId; the next U is later.
+        let snapshot = json!({"lastUpdateId":11739776192058_i64,
+            "bids":[["315.48","2"]],"asks":[["315.49","2"]]});
+        let overlap = json!({"U":11739776188554_i64,"u":11739776192058_i64,
+            "pu":11739776186293_i64,"b":[["315.48","2"]],"a":[]});
+        let mut buffered = VecDeque::from([overlap.clone()]);
+        assert!(!snapshot_ahead_of_stream(
+            Exchange::Binance,
+            MarketKind::Perp,
+            &snapshot,
+            &buffered
+        ));
+        let mut book = BookAccumulator::default();
+        assert!(
+            initialize_deep_book(
+                Exchange::Binance,
+                MarketKind::Perp,
+                &snapshot,
+                &mut buffered,
+                &mut book
+            )
+            .unwrap()
+        );
+        assert_eq!(book.sequence, Some(11739776192058));
+        let next = json!({"U":11739776216783_i64,"u":11739776223087_i64,
+            "pu":11739776192058_i64,"b":[["315.48","3"]],"a":[]});
+        let mut buffered = VecDeque::from([overlap, next]);
+        let mut book = BookAccumulator::default();
+        assert!(
+            initialize_deep_book(
+                Exchange::Binance,
+                MarketKind::Perp,
+                &snapshot,
+                &mut buffered,
+                &mut book
+            )
+            .unwrap()
+        );
+        assert!(buffered.is_empty());
+        assert_eq!(book.sequence, Some(11739776223087));
+        assert_eq!(book.book(1).bids[0].size, "3");
+
+        let mut missed_overlap = VecDeque::from([json!({
+            "U":11739776216783_i64,"u":11739776223087_i64,
+            "pu":11739776192058_i64,"b":[],"a":[]
+        })]);
+        assert!(
+            !initialize_deep_book(
+                Exchange::Binance,
+                MarketKind::Perp,
+                &snapshot,
+                &mut missed_overlap,
+                &mut book
+            )
+            .unwrap()
+        );
+        assert_eq!(book.sequence, Some(11739776223087));
     }
 
     #[test]
