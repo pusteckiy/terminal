@@ -416,10 +416,15 @@ pub fn ui(
         view.anchor = Some(group(reference, step));
     }
     let window = settings.window_secs.clamp(1, 600);
+    let spread = bid
+        .and_then(|price| price.to_f64())
+        .zip(ask.and_then(|price| price.to_f64()))
+        .and_then(|(bid, ask)| crate::view::spread_percent_text(bid, ask))
+        .unwrap_or_else(|| "—".to_owned());
     ui.horizontal(|ui| {
         let unit = info.map(|info| if settings.units == Units::Base { info.base.as_str() } else { info.quote.as_str() })
             .unwrap_or(if settings.units == Units::Base { "BASE" } else { "QUOTE" });
-        ui.label(egui::RichText::new(format!("{unit} · {window}s · step {}", step.normalize())).monospace().size(10.0).color(MUTED))
+        ui.label(egui::RichText::new(format!("{unit} · {window}s · step {} · SPR {spread}", step.normalize())).monospace().size(10.0).color(MUTED))
             .on_hover_text("BID / ASK: resting liquidity. SOLD / BOUGHT: taker volume grouped by price and UTC second in the selected rolling window. ORDERS: visible accounts' open orders. Flow starts when the market connects; unavailable book depth is shown as —. Scroll to explore; double-click the ladder to recenter.");
         if !view.following && ui.small_button("Center").on_hover_text("Follow the current best bid / ask").clicked() {
             view.following = true;

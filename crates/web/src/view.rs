@@ -320,7 +320,7 @@ fn compact_decimal(value: &str) -> &str {
     }
 }
 
-fn spread_percent_text(bid: f64, ask: f64) -> Option<String> {
+pub(crate) fn spread_percent_text(bid: f64, ask: f64) -> Option<String> {
     let midpoint = (ask + bid) / 2.0;
     if !midpoint.is_finite() || midpoint <= 0.0 {
         return None;
