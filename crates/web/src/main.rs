@@ -2331,7 +2331,7 @@ fn ws_url() -> String {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     eframe::run_native(
-        "Rust Terminal",
+        "Terminal",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]),
             ..Default::default()

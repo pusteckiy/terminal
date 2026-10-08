@@ -1,4 +1,4 @@
-# Rust Terminal
+# Terminal
 
 A real-time crypto market-data terminal built in Rust. The interface runs in the browser through WebAssembly; a Rust server connects to exchange feeds and keeps the order books in sync. No JavaScript framework.
 

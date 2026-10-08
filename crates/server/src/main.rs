@@ -662,7 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!("Rust Terminal listening on http://{address}");
+    eprintln!("Terminal listening on http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
 }
