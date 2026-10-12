@@ -1,3 +1,4 @@
+mod audio;
 mod batch;
 mod dom;
 mod fills;
@@ -587,6 +588,7 @@ fn apply_book_side(levels: &mut Vec<Level>, changes: Vec<BookChange>, bids: bool
 }
 
 struct TerminalApp {
+    audio: audio::TradeAudio,
     workspaces: Vec<Tree<Pane>>,
     active_workspace: usize,
     tab_hover: Option<(usize, f64)>,
@@ -656,6 +658,12 @@ impl TerminalApp {
             .filter(|index| *index < workspaces.len())
             .unwrap_or(0);
         let mut app = Self {
+            audio: audio::TradeAudio::new(
+                cc.storage
+                    .and_then(|storage| storage.get_string("trade_audio"))
+                    .and_then(|saved| serde_json::from_str(&saved).ok())
+                    .unwrap_or_default(),
+            ),
             workspaces,
             active_workspace,
             tab_hover: None,
@@ -994,6 +1002,7 @@ impl TerminalApp {
                                 data.set_price(last_price);
                             }
                             ServerMessage::Trades { trades, .. } => {
+                                self.audio.trades(&trades, utc_now_ms());
                                 for trade in trades {
                                     data.push_trade(trade);
                                 }
@@ -1015,6 +1024,7 @@ impl TerminalApp {
                     }
                 }
                 WsEvent::Closed | WsEvent::Error(_) => {
+                    self.audio.clear_pending();
                     self.socket_open = false;
                     self.subscribed.clear();
                     self.subscribed_accounts.clear();
@@ -1049,7 +1059,7 @@ impl TerminalApp {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(10.0);
-                let tabs_width = (ui.available_width() - 260.0).max(100.0);
+                let tabs_width = (ui.available_width() - 295.0).max(100.0);
                 let mut tabs = |ui: &mut egui::Ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for index in 0..self.workspaces.len() {
@@ -1247,6 +1257,7 @@ impl TerminalApp {
                         });
                     response.on_hover_text("Add a widget beside the focused pane");
                     self.account_menu(ui);
+                    self.audio.menu(ui);
                     ui.add_space(4.0);
                     let now_ms = utc_now_ms();
                     let seconds = now_ms.div_euclid(1_000).rem_euclid(86_400);
@@ -1495,6 +1506,7 @@ impl TerminalApp {
 
     fn switch_workspace(&mut self, index: usize) {
         if index < self.workspaces.len() && index != self.active_workspace {
+            self.audio.clear_pending();
             self.active_workspace = index;
             self.focused = None;
             self.sync_subscriptions();
@@ -2296,9 +2308,13 @@ impl eframe::App for TerminalApp {
             self.sync_subscriptions();
             self.request_catalogs(needed_catalogs, retry_catalogs);
         });
+        self.audio.flush(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(settings) = serde_json::to_string(self.audio.settings()) {
+            storage.set_string("trade_audio", settings);
+        }
         if let Ok(workspaces) = serde_json::to_string(&self.workspaces) {
             storage.set_string("terminal_workspaces", workspaces);
             storage.set_string("active_terminal", self.active_workspace.to_string());
@@ -2381,6 +2397,7 @@ mod tests {
 
     pub(super) fn test_app() -> TerminalApp {
         TerminalApp {
+            audio: audio::TradeAudio::new(audio::Settings::default()),
             workspaces: (0..3).map(TerminalApp::default_tree).collect(),
             active_workspace: 0,
             tab_hover: None,
