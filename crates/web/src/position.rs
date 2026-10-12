@@ -856,7 +856,6 @@ pub fn ui(
                 );
                 ui.monospace(&account.address);
             }
-            ui.weak("Perp Size updates from confirmed fills; valuation from account state. Gaps indicate unavailable data.");
         });
     }
     ui.ctx()
