@@ -19,6 +19,21 @@ impl Dialog {
             focus: true,
         }
     }
+
+    fn choice(&self, from: &Market, options: &[Market]) -> Option<Market> {
+        self.choices
+            .get(from)
+            .filter(|choice| options.contains(choice))
+            .or_else(|| {
+                options.iter().find(|option| {
+                    from.exchange == Exchange::Hyperliquid
+                        && from.kind == MarketKind::Perp
+                        && dex(&option.symbol) == dex(&from.symbol)
+                })
+            })
+            .or_else(|| options.first().filter(|_| options.len() == 1))
+            .cloned()
+    }
 }
 
 struct Previous {
@@ -94,9 +109,6 @@ fn candidates(from: &Market, base: &str, catalog: &[SymbolInfo]) -> Vec<Market> 
         .filter(|info| {
             info.base.eq_ignore_ascii_case(base)
                 && quote.is_some_and(|quote| info.quote.eq_ignore_ascii_case(quote))
-                && (from.exchange != Exchange::Hyperliquid
-                    || from.kind != MarketKind::Perp
-                    || dex(&info.symbol) == dex(&from.symbol))
         })
         .map(|info| Market {
             symbol: info.symbol.clone(),
@@ -161,12 +173,7 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
                     .get(&(from.exchange, from.kind))
                     .map(|catalog| candidates(from, base, catalog))
                     .unwrap_or_default();
-                let resolved = dialog
-                    .choices
-                    .get(from)
-                    .filter(|choice| options.contains(choice))
-                    .cloned()
-                    .or_else(|| (options.len() == 1).then(|| options[0].clone()));
+                let resolved = dialog.choice(from, &options);
                 resolved.unwrap_or_else(|| {
                     // Retain the venue/quote/DEX identity for a later batch change.
                     // This market is explicitly blocked from rendering/subscription.
@@ -262,9 +269,9 @@ pub fn ui(app: &mut TerminalApp, ctx: &egui::Context) {
                                 } else if options.len() == 1 {
                                     ui.label(RichText::new(&options[0].symbol).monospace().size(12.0));
                                 } else {
-                                    let choice = dialog.choices.get(market);
-                                    unresolved |= choice.is_none_or(|choice| !options.contains(choice));
-                                    egui::menu::MenuButton::new(choice.map_or("Choose market…", |market| &market.symbol)).ui(ui, |ui| {
+                                    let choice = dialog.choice(market, &options);
+                                    unresolved |= choice.is_none();
+                                    egui::menu::MenuButton::new(choice.as_ref().map_or("Choose market…", |market| &market.symbol)).ui(ui, |ui| {
                                         for option in options { if ui.button(&option.symbol).clicked() { dialog.choices.insert(market.clone(), option); ui.close(); } }
                                     });
                                 }
@@ -388,7 +395,116 @@ mod tests {
     }
 
     #[test]
-    fn resolution_preserves_quote_and_hip3_dex_and_requires_ambiguous_choice() {
+    fn reopening_batch_allows_switching_dex_for_the_same_symbol() {
+        let mut app = crate::tests::test_app();
+        let native = market(Exchange::Hyperliquid, "BTC");
+        let xyz = market(Exchange::Hyperliquid, "xyz:UNITREE");
+        let para = market(Exchange::Hyperliquid, "para:UNITREE");
+        let catalog = vec![
+            info("BTC", "BTC", "USDC"),
+            info("xyz:UNITREE", "UNITREE", "USDC"),
+            info("para:UNITREE", "UNITREE", "USDC"),
+        ];
+        app.catalogs
+            .insert((Exchange::Hyperliquid, MarketKind::Perp), catalog.clone());
+        let mut tiles = Tiles::default();
+        let pane = tiles.insert_pane(Pane::new(WidgetKind::Dom, native.clone()));
+        app.workspaces[0] = Tree::new("repeat-dex", pane, tiles);
+        let mut first = Dialog::new(0);
+        first.choices.insert(native, xyz.clone());
+        apply(&mut app, &first, "UNITREE", 0.0);
+        let current = app.workspaces[0]
+            .tiles
+            .get_pane(&pane)
+            .unwrap()
+            .market
+            .clone();
+        assert_eq!(current, xyz);
+        let options = candidates(&current, "UNITREE", &catalog);
+        assert_eq!(
+            options,
+            [xyz.clone(), para.clone()],
+            "the second preview must still offer both DEXs"
+        );
+        let mut second = Dialog::new(0);
+        assert_eq!(second.choice(&current, &options), Some(xyz.clone()));
+        second.choices.insert(current.clone(), para.clone());
+        assert_eq!(second.choice(&current, &options), Some(para.clone()));
+        apply(&mut app, &second, "UNITREE", 1.0);
+        let updated = app.workspaces[0].tiles.get_pane(&pane).unwrap();
+        assert_eq!(updated.market, para);
+        assert!(updated.unavailable_markets.is_empty());
+        let undo = app.batch_undo.take().unwrap();
+        restore(&mut app, undo);
+        assert_eq!(app.workspaces[0].tiles.get_pane(&pane).unwrap().market, xyz);
+    }
+
+    #[test]
+    fn hyperliquid_batch_falls_back_to_other_dexes_without_changing_quote() {
+        let native = market(Exchange::Hyperliquid, "BTC");
+        let xyz = market(Exchange::Hyperliquid, "xyz:UNITREE");
+        let para = market(Exchange::Hyperliquid, "para:UNITREE");
+        let catalog = vec![
+            info("BTC", "BTC", "USDC"),
+            info("xyz:UNITREE", "UNITREE", "USDC"),
+            info("para:UNITREE", "UNITREE", "USDC"),
+            info("cash:UNITREE", "UNITREE", "USDH"),
+        ];
+        assert_eq!(
+            candidates(&native, "UNITREE", &catalog),
+            [xyz.clone(), para.clone()]
+        );
+        assert_eq!(
+            candidates(&xyz, "UNITREE", &catalog),
+            [xyz.clone(), para.clone()]
+        );
+        assert_eq!(candidates(&para, "BTC", &catalog), [native]);
+        assert!(candidates(&xyz, "MISSING", &catalog).is_empty());
+    }
+
+    #[test]
+    fn batch_applies_chosen_hip3_market_to_shared_sources_and_undo_restores_native() {
+        let mut app = crate::tests::test_app();
+        let from = market(Exchange::Hyperliquid, "BTC");
+        let chosen = market(Exchange::Hyperliquid, "xyz:UNITREE");
+        app.catalogs.insert(
+            (Exchange::Hyperliquid, MarketKind::Perp),
+            vec![
+                info("BTC", "BTC", "USDC"),
+                info("xyz:UNITREE", "UNITREE", "USDC"),
+                info("para:UNITREE", "UNITREE", "USDC"),
+            ],
+        );
+        let mut tiles = Tiles::default();
+        let dom = tiles.insert_pane(Pane::new(WidgetKind::Dom, from.clone()));
+        let mut prices = Pane::new(WidgetKind::Compare, from.clone());
+        prices.series = vec![from.clone()];
+        prices.orderflow.source = Some(from.clone());
+        let prices = tiles.insert_pane(prices);
+        let root = tiles.insert_horizontal_tile(vec![dom, prices]);
+        app.workspaces[0] = Tree::new("hip3-batch", root, tiles);
+        let before = serde_json::to_string(&app.workspaces).unwrap();
+        let mut dialog = Dialog::new(0);
+        dialog.choices.insert(from.clone(), chosen.clone());
+        assert_eq!(apply(&mut app, &dialog, "UNITREE", 0.0), 2);
+        let dom = app.workspaces[0].tiles.get_pane(&dom).unwrap();
+        assert_eq!(dom.market, chosen);
+        assert!(dom.unavailable_markets.is_empty());
+        let prices = app.workspaces[0].tiles.get_pane(&prices).unwrap();
+        assert_eq!(prices.series, [chosen.clone()]);
+        assert_eq!(prices.orderflow.source.as_ref(), Some(&chosen));
+        assert!(prices.unavailable_markets.is_empty());
+        app.socket_open = true;
+        app.sync_subscriptions();
+        assert!(app.subscribed.contains(&chosen));
+        assert!(!app.subscribed.contains(&from));
+        let undo = app.batch_undo.take().unwrap();
+        restore(&mut app, undo);
+        assert_eq!(serde_json::to_string(&app.workspaces).unwrap(), before);
+    }
+
+    #[test]
+    fn resolution_preserves_quote_defaults_to_current_dex_and_requires_ambiguous_choice() {
         let from = market(Exchange::Hyperliquid, "xyz:NVDA");
         let catalog = vec![
             info("xyz:NVDA", "NVDA", "USDC"),
@@ -396,9 +512,18 @@ mod tests {
             info("flx:BTC", "BTC", "USDC"),
             info("xyz:BTC", "BTC", "USDC"),
         ];
+        let options = candidates(&from, "BTC", &catalog);
         assert_eq!(
-            candidates(&from, "BTC", &catalog),
-            [market(Exchange::Hyperliquid, "xyz:BTC")]
+            options,
+            [
+                market(Exchange::Hyperliquid, "BTC"),
+                market(Exchange::Hyperliquid, "flx:BTC"),
+                market(Exchange::Hyperliquid, "xyz:BTC")
+            ]
+        );
+        assert_eq!(
+            Dialog::new(0).choice(&from, &options),
+            Some(market(Exchange::Hyperliquid, "xyz:BTC"))
         );
         let from = market(Exchange::Binance, "PONSUSDC");
         let catalog = vec![
@@ -416,6 +541,10 @@ mod tests {
             info("BTC2", "BTC", "USDC"),
         ];
         assert_eq!(candidates(&from, "BTC", &catalog).len(), 2);
+        assert_eq!(
+            Dialog::new(0).choice(&from, &candidates(&from, "BTC", &catalog)),
+            None
+        );
         assert!(candidates(&from, "BT", &catalog).is_empty());
     }
 

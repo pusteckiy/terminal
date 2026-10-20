@@ -15,7 +15,7 @@ Connect a Hyperliquid wallet address from the account button beside **Add Widget
 
 Hyperliquid **Perp** includes native and HIP-3 markets from all builder DEXs. Search for symbols such as `NVDA` (NVIDIA) or `SPCX`; DEX prefixes such as `xyz:NVDA` distinguish separate markets. These markets use the same charts, books, live prices, tape, and account widgets.
 
-Right-click a terminal tab and choose **Change symbol…** to switch its market widgets together, including every PRICES and TRADES source. Preview the venue symbols before applying; exchange, Spot/Perp, quote currency, and HIP-3 DEX stay the same. Unavailable sources pause with an explicit label. **Undo** is available for 10 seconds. FILLS keeps its account filters.
+Right-click a terminal tab and choose **Change symbol…** to switch its market widgets together, including every PRICES and TRADES source. Preview the venue symbols before applying; exchange, Spot/Perp, and quote currency stay the same. Hyperliquid always offers all matching DEX markets, such as `xyz:UNITREE` and `para:UNITREE`, with the current DEX preselected when available. Otherwise, multiple matches require a choice. Unavailable sources pause with an explicit label. **Undo** is available for 10 seconds. FILLS keeps its account filters.
 
 The speaker button in the top bar controls **Trade sounds** and **Volume** for all terminal tabs in the browser. Sound is off by default. Live buys use a soft higher tone and sells a lower tone; dense activity is combined into 100 ms sound pulses. Settings are saved locally.
 
