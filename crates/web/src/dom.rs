@@ -1,11 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use terminal_core::{Account, Book, OwnOrder, SymbolInfo, Trade, TradeSide};
 
-use crate::{BORDER, GREEN, MUTED, MarketData, RED, SURFACE, TEXT, view::quote_size_text};
+use crate::{
+    BORDER, GREEN, MUTED, MarketData, RED, SURFACE, TEXT, TradePoint,
+    view::{quote_size_text, simplify_points, trade_color, trade_dot_radius, trade_utc},
+};
 
 const ROW_HEIGHT: f32 = 22.0;
 const HISTORY_SECONDS: i64 = 600;
@@ -46,6 +49,8 @@ pub struct Settings {
     grouping: Grouping,
     window_secs: u32,
     units: Units,
+    compact: bool,
+    trade_stream: bool,
 }
 
 impl Default for Settings {
@@ -54,11 +59,17 @@ impl Default for Settings {
             grouping: Grouping::Auto,
             window_secs: 60,
             units: Units::Base,
+            compact: false,
+            trade_stream: false,
         }
     }
 }
 
 pub fn config_ui(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.checkbox(&mut settings.compact, "Compact DOM");
+    ui.checkbox(&mut settings.trade_stream, "Show trade flow")
+        .on_hover_text("Show live trades to the left, aligned to the DOM price rows. Both sides scroll together and use the same price grouping and trade window.");
+    ui.separator();
     ui.horizontal(|ui| {
         ui.label("Price grouping");
         // ComboBox opens a second root popup and replaces the enclosing config
@@ -335,6 +346,155 @@ fn amount(value: f64) -> String {
     quote_size_text(&value.to_string())
 }
 
+fn column_edges(rect: Rect, compact: bool) -> [f32; 7] {
+    let weights = if compact {
+        [0.0, 0.0, 0.30, 0.30, 0.70, 0.70, 1.0]
+    } else {
+        [0.0, 0.12, 0.29, 0.46, 0.66, 0.83, 1.0]
+    };
+    weights.map(|weight| rect.left() + rect.width() * weight)
+}
+
+fn level_y(price: Decimal, top_price: Decimal, step: Decimal, body: Rect) -> f32 {
+    // The top price is step-aligned; ceil maps fills to the ladder's floor groups.
+    let row = ((top_price - price) / step).ceil().to_f32().unwrap_or(0.0);
+    body.top() + (row + 0.5) * ROW_HEIGHT
+}
+
+fn trade_flow<'a>(
+    painter: &egui::Painter,
+    plot: Rect,
+    data: &'a MarketData,
+    top_price: Decimal,
+    step: Decimal,
+    now_ms: i64,
+    window: u32,
+    pointer: Option<Pos2>,
+) -> Option<&'a TradePoint> {
+    // Match the ladder's UTC-second window, including expiration while idle.
+    let start_ms = (now_ms.div_euclid(1_000) - i64::from(window) + 1) * 1_000;
+    let end_ms = now_ms.max(start_ms + 1);
+    let x_for =
+        |time| plot.left() + (time - start_ms) as f32 / (end_ms - start_ms) as f32 * plot.width();
+    let mut points: Vec<_> = data
+        .price_trades
+        .iter()
+        .filter(|trade| {
+            (start_ms..=now_ms).contains(&trade.time_ms)
+                && trade.size.is_finite()
+                && trade.size > 0.0
+        })
+        .filter_map(|trade| {
+            let price = trade.exact_price.filter(|price| *price > Decimal::ZERO)?;
+            let y = level_y(price, top_price, step, plot);
+            Some((
+                trade,
+                Pos2::new(
+                    x_for(trade.time_ms),
+                    y.clamp(plot.top() - ROW_HEIGHT, plot.bottom() + ROW_HEIGHT),
+                ),
+            ))
+        })
+        .collect();
+    if !points.is_sorted_by_key(|(trade, _)| trade.time_ms) {
+        points.sort_by_key(|(trade, _)| trade.time_ms);
+    }
+    let plot_painter = painter.with_clip_rect(plot);
+    let intervals = (plot.width() / 90.0).floor().clamp(1.0, 8.0) as i64;
+    for tick in 0..=intervals {
+        let time = start_ms + (end_ms - start_ms) * tick / intervals;
+        let x = x_for(time);
+        plot_painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(0.5, BORDER.gamma_multiply(0.65)),
+        );
+        if plot.width() >= 130.0 || tick == intervals {
+            painter.text(
+                Pos2::new(x, plot.bottom() + 12.0),
+                if tick == 0 {
+                    Align2::LEFT_CENTER
+                } else if tick == intervals {
+                    Align2::RIGHT_CENTER
+                } else {
+                    Align2::CENTER_CENTER
+                },
+                trade_utc(time, true),
+                FontId::monospace(9.0),
+                MUTED,
+            );
+        }
+    }
+    let line: Vec<_> = points
+        .iter()
+        .map(|(trade, pos)| (trade.time_ms, f64::from(pos.y)))
+        .collect();
+    let line = simplify_points(&line, start_ms, end_ms, plot.width().max(1.0) as usize);
+    if line.len() > 1 {
+        plot_painter.add(egui::Shape::line(
+            line.into_iter()
+                .map(|(time, y)| Pos2::new(x_for(time), y as f32))
+                .collect(),
+            Stroke::new(1.0, MUTED.gamma_multiply(0.55)),
+        ));
+    }
+    let draw = |trade: &TradePoint, pos: Pos2| {
+        if plot.contains(pos) {
+            plot_painter.circle_filled(
+                pos,
+                trade_dot_radius(trade),
+                trade_color(trade.side, MUTED),
+            );
+        }
+    };
+    if points.len() <= plot.width() as usize * 2 {
+        for &(trade, pos) in &points {
+            draw(trade, pos);
+        }
+    } else {
+        // Dense tape keeps the largest real fill per pixel, price row and side.
+        let mut dots: HashMap<_, (&TradePoint, Pos2)> = HashMap::new();
+        for &(trade, pos) in &points {
+            if !plot.contains(pos) {
+                continue;
+            }
+            let key = (
+                pos.x.floor() as i32,
+                ((pos.y - plot.top()) / ROW_HEIGHT).floor() as i32,
+                trade.side as u8,
+            );
+            let current = dots.entry(key).or_insert((trade, pos));
+            if trade.size > current.0.size {
+                *current = (trade, pos);
+            }
+        }
+        for (_, (trade, pos)) in dots {
+            draw(trade, pos);
+        }
+    }
+    if let Some(&(trade, pos)) = points.last() {
+        draw(trade, pos);
+    }
+    pointer
+        .filter(|pos| plot.contains(*pos))
+        .and_then(|pointer| {
+            let (trade, pos) = points
+                .iter()
+                .filter(|(_, pos)| plot.contains(*pos) && pos.distance(pointer) <= 12.0)
+                .min_by(|(_, a), (_, b)| {
+                    a.distance_sq(pointer).total_cmp(&b.distance_sq(pointer))
+                })?;
+            plot_painter.circle_stroke(*pos, trade_dot_radius(trade) + 2.0, Stroke::new(1.0, TEXT));
+            plot_painter.line_segment(
+                [
+                    Pos2::new(pos.x, plot.top()),
+                    Pos2::new(pos.x, plot.bottom()),
+                ],
+                Stroke::new(0.5, MUTED),
+            );
+            Some(*trade)
+        })
+}
+
 fn anchor_bounds(
     book: &Book,
     history: &History,
@@ -421,28 +581,97 @@ pub fn ui(
         .zip(ask.and_then(|price| price.to_f64()))
         .and_then(|(bid, ask)| crate::view::spread_percent_text(bid, ask))
         .unwrap_or_else(|| "—".to_owned());
-    ui.horizontal(|ui| {
-        let unit = info.map(|info| if settings.units == Units::Base { info.base.as_str() } else { info.quote.as_str() })
-            .unwrap_or(if settings.units == Units::Base { "BASE" } else { "QUOTE" });
-        ui.label(egui::RichText::new(format!("{unit} · {window}s · step {} · SPR {spread}", step.normalize())).monospace().size(10.0).color(MUTED))
-            .on_hover_text("BID / ASK: resting liquidity. SOLD / BOUGHT: taker volume grouped by price and UTC second in the selected rolling window. ORDERS: visible accounts' open orders. Flow starts when the market connects; unavailable book depth is shown as —. Scroll to explore; double-click the ladder to recenter.");
-        if !view.following && ui.small_button("Center").on_hover_text("Follow the current best bid / ask").clicked() {
-            view.following = true;
-            view.anchor = Some(group(reference, step));
-        }
-    });
     let (rect, response) = ui.allocate_exact_size(
         ui.available_size().max(Vec2::splat(1.0)),
         Sense::click_and_drag(),
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, SURFACE);
+    let ladder = Rect::from_min_max(
+        Pos2::new(
+            rect.left()
+                + if settings.trade_stream {
+                    rect.width() * if settings.compact { 0.62 } else { 0.50 }
+                } else {
+                    0.0
+                },
+            rect.top(),
+        ),
+        rect.right_bottom(),
+    );
     let body = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.top() + 24.0),
+        Pos2::new(rect.left(), rect.top() + 46.0),
         rect.right_bottom(),
     );
     if body.height() < ROW_HEIGHT || rect.width() < 100.0 {
         return;
+    }
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 10.0, body.top()),
+        Pos2::new(
+            ladder.left() - 10.0,
+            (body.bottom() - 54.0).max(body.top() + 1.0),
+        ),
+    );
+    if settings.trade_stream {
+        painter.rect_filled(ladder, 0.0, crate::BG);
+    }
+    let unit = info
+        .map(|info| {
+            if settings.units == Units::Base {
+                info.base.as_str()
+            } else {
+                info.quote.as_str()
+            }
+        })
+        .unwrap_or(if settings.units == Units::Base {
+            "BASE"
+        } else {
+            "QUOTE"
+        });
+    let metrics = if settings.trade_stream {
+        format!("step {} · SPR {spread}", step.normalize())
+    } else {
+        format!(
+            "{unit} · {window}s · step {} · SPR {spread}",
+            step.normalize()
+        )
+    };
+    let mut controls = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                Pos2::new(ladder.left() + 8.0, rect.top()),
+                Pos2::new(ladder.right() - 8.0, rect.top() + 22.0),
+            ))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let reserve = if !view.following && !settings.trade_stream {
+        48.0
+    } else {
+        0.0
+    };
+    controls.add_sized([(controls.available_width()-reserve).max(1.0), 18.0],
+        egui::Label::new(egui::RichText::new(&metrics).monospace().size(10.0).color(MUTED)).truncate())
+        .on_hover_text(format!("{unit} · {window}s · {metrics}\nBID / ASK: resting liquidity. SOLD / BOUGHT: taker volume in the selected rolling window. ORDERS: visible accounts' orders. Scroll to explore; double-click to recenter."));
+    if !view.following {
+        let center = if settings.trade_stream {
+            ui.put(
+                Rect::from_center_size(
+                    Pos2::new(ladder.left() - 34.0, rect.top() + 22.0),
+                    Vec2::new(48.0, 20.0),
+                ),
+                egui::Button::new("Center"),
+            )
+        } else {
+            controls.small_button("Center")
+        };
+        if center
+            .on_hover_text("Follow the current best bid / ask")
+            .clicked()
+        {
+            view.following = true;
+            view.anchor = Some(group(reference, step));
+        }
     }
     if response.double_clicked() {
         view.following = true;
@@ -475,7 +704,12 @@ pub fn ui(
         view.anchor = view.anchor.map(|price| price.clamp(low, high));
     }
     let anchor = view.anchor.unwrap_or(reference);
-    let top_price = anchor + step * Decimal::from(count / 2);
+    let centered_rows = if settings.trade_stream {
+        (plot.height() / ROW_HEIGHT).ceil() as i64
+    } else {
+        count
+    };
+    let top_price = anchor + step * Decimal::from(centered_rows / 2);
     let low = (top_price - step * Decimal::from(count - 1)).max(Decimal::ZERO);
     let high = top_price + step;
     let rows = book_rows(book, orders, step, low, high);
@@ -497,15 +731,35 @@ pub fn ui(
         })
         .fold(0.0_f64, f64::max)
         .max(1e-20);
-    let edges =
-        [0.0, 0.12, 0.29, 0.46, 0.66, 0.83, 1.0].map(|weight| rect.left() + rect.width() * weight);
-    let font = FontId::monospace((rect.width() / 42.0).clamp(8.0, 12.0));
+    let edges = column_edges(ladder, settings.compact);
+    let font = FontId::monospace(
+        (ladder.width() / if settings.compact { 23.0 } else { 42.0 }).clamp(8.0, 12.0),
+    );
+    if settings.trade_stream {
+        painter.text(
+            Pos2::new(rect.left() + 10.0, rect.top() + 22.0),
+            Align2::LEFT_CENTER,
+            "TRADES",
+            FontId::monospace(10.0),
+            MUTED,
+        );
+        painter.text(
+            Pos2::new(rect.left() + 60.0, rect.top() + 22.0),
+            Align2::LEFT_CENTER,
+            format!("· {window}s"),
+            FontId::monospace(10.0),
+            MUTED,
+        );
+    }
     for (index, label) in ["ORDERS", "BID", "SOLD", "PRICE", "BOUGHT", "ASK"]
         .into_iter()
         .enumerate()
     {
+        if edges[index + 1] <= edges[index] {
+            continue;
+        }
         painter.text(
-            Pos2::new((edges[index] + edges[index + 1]) / 2.0, rect.top() + 12.0),
+            Pos2::new((edges[index] + edges[index + 1]) / 2.0, rect.top() + 34.0),
             Align2::CENTER_CENTER,
             label,
             FontId::monospace(
@@ -541,6 +795,33 @@ pub fn ui(
         let y = body.top() + index as f32 * ROW_HEIGHT;
         let row = rows.get(&price).copied().unwrap_or_default();
         let flow = flows.get(&price).copied().unwrap_or_default();
+        if settings.trade_stream {
+            let both = row.own.buy.base > 0.0 && row.own.sell.base > 0.0;
+            for (size, color, buy) in [
+                (row.own.buy.base, GREEN, true),
+                (row.own.sell.base, RED, false),
+            ] {
+                if size > 0.0 {
+                    let left = if both && !buy {
+                        plot.center().x
+                    } else {
+                        plot.left()
+                    };
+                    let right = if both && buy {
+                        plot.center().x
+                    } else {
+                        plot.right()
+                    };
+                    painter.with_clip_rect(plot).line_segment(
+                        [
+                            Pos2::new(left, y + ROW_HEIGHT / 2.0),
+                            Pos2::new(right, y + ROW_HEIGHT / 2.0),
+                        ],
+                        Stroke::new(1.0, color.gamma_multiply(0.35)),
+                    );
+                }
+            }
+        }
         let cell = |col: usize| {
             Rect::from_min_max(
                 Pos2::new(edges[col], y),
@@ -550,12 +831,22 @@ pub fn ui(
         if hovered == Some(index) {
             cells_painter.rect_filled(
                 Rect::from_min_max(
-                    Pos2::new(rect.left(), y),
+                    Pos2::new(ladder.left(), y),
                     Pos2::new(rect.right(), y + ROW_HEIGHT),
                 ),
                 0.0,
                 Color32::from_white_alpha(8),
             );
+            if settings.trade_stream {
+                painter.with_clip_rect(plot).rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(rect.left(), y),
+                        Pos2::new(ladder.left(), y + ROW_HEIGHT),
+                    ),
+                    0.0,
+                    Color32::from_white_alpha(8),
+                );
+            }
         }
         for (col, value, color, max, align_right) in [
             (1, row.bid.value(settings.units), GREEN, max_book, true),
@@ -564,6 +855,9 @@ pub fn ui(
             (5, row.ask.value(settings.units), RED, max_book, false),
         ] {
             let box_rect = cell(col);
+            if box_rect.width() <= 0.0 {
+                continue;
+            }
             let on_side = (col == 1 && best_bid_row.is_some_and(|best| price <= best))
                 || (col == 5 && best_ask_row.is_some_and(|best| price >= best));
             if on_side {
@@ -659,7 +953,7 @@ pub fn ui(
             (row.own.buy.value(settings.units), GREEN, -5.0),
             (row.own.sell.value(settings.units), RED, 5.0),
         ] {
-            if value > 0.0 {
+            if value > 0.0 && own_cell.width() > 0.0 {
                 let both = row.own.buy.base > 0.0 && row.own.sell.base > 0.0;
                 cells_painter.with_clip_rect(own_cell.intersect(body)).text(
                     Pos2::new(
@@ -674,17 +968,133 @@ pub fn ui(
             }
         }
         cells_painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            [
+                Pos2::new(
+                    if settings.trade_stream && y >= plot.bottom() {
+                        ladder.left()
+                    } else {
+                        rect.left()
+                    },
+                    y,
+                ),
+                Pos2::new(rect.right(), y),
+            ],
             Stroke::new(0.5, BORDER.gamma_multiply(0.65)),
         );
     }
     for &x in &edges[1..6] {
         painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            [Pos2::new(x, rect.top()), Pos2::new(x, body.bottom())],
             Stroke::new(0.5, BORDER),
         );
     }
-    if let Some(index) = hovered {
+    if settings.trade_stream {
+        painter.line_segment(
+            [
+                Pos2::new(ladder.left(), rect.top()),
+                Pos2::new(ladder.left(), body.bottom()),
+            ],
+            Stroke::new(1.0, BORDER),
+        );
+        let inspected = trade_flow(
+            &painter,
+            plot,
+            data,
+            top_price,
+            step,
+            utc_ms,
+            window,
+            response.hover_pos(),
+        )
+        .or_else(|| {
+            if response.hover_pos().is_none() {
+                data.latest_trade.as_ref().filter(|trade| {
+                    (0..i64::from(window) * 1_000).contains(&(utc_ms - trade.time_ms))
+                })
+            } else {
+                None
+            }
+        });
+        let footer = painter.with_clip_rect(Rect::from_min_max(
+            Pos2::new(rect.left() + 8.0, plot.bottom() + 22.0),
+            Pos2::new(ladder.left() - 8.0, rect.bottom()),
+        ));
+        if let Some(trade) = inspected {
+            let side = match trade.side {
+                TradeSide::Buy => "BUY",
+                TradeSide::Sell => "SELL",
+                TradeSide::Unknown => "TRADE",
+            };
+            let color = trade_color(trade.side, MUTED);
+            footer.text(
+                Pos2::new(rect.left() + 10.0, plot.bottom() + 31.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} UTC · {side} · {}",
+                    trade_utc(trade.time_ms, false),
+                    trade.exact_price.map_or_else(
+                        || trade.price.to_string(),
+                        |price| price.normalize().to_string()
+                    )
+                ),
+                FontId::monospace(10.0),
+                color,
+            );
+            footer.text(
+                Pos2::new(rect.left() + 10.0, plot.bottom() + 45.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} {} · {} {}",
+                    amount(trade.size),
+                    info.map_or("BASE", |info| info.base.as_str()),
+                    amount(trade.price * trade.size),
+                    info.map_or("QUOTE", |info| info.quote.as_str())
+                ),
+                FontId::monospace(10.0),
+                TEXT,
+            );
+        } else if let Some(index) =
+            hovered.filter(|_| response.hover_pos().is_some_and(|pos| plot.contains(pos)))
+        {
+            let price = top_price - step * Decimal::from(index);
+            let row = rows.get(&price).copied().unwrap_or_default();
+            footer.text(
+                Pos2::new(rect.left() + 10.0, plot.bottom() + 31.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} ≤ price < {}",
+                    price.normalize(),
+                    (price + step).normalize()
+                ),
+                FontId::monospace(10.0),
+                MUTED,
+            );
+            footer.text(
+                Pos2::new(rect.left() + 10.0, plot.bottom() + 45.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "BID {} · ASK {} {unit}",
+                    if deepest_bid.is_none_or(|last| price < last) {
+                        "—".to_owned()
+                    } else {
+                        amount(row.bid.value(settings.units))
+                    },
+                    if deepest_ask.is_none_or(|last| price > last) {
+                        "—".to_owned()
+                    } else {
+                        amount(row.ask.value(settings.units))
+                    }
+                ),
+                FontId::monospace(10.0),
+                MUTED,
+            );
+        }
+    }
+    if let Some(index) = hovered.filter(|_| {
+        response
+            .hover_pos()
+            .is_some_and(|pos| pos.x >= ladder.left())
+    }) {
         let price = top_price - step * Decimal::from(index);
         let row = rows.get(&price).copied().unwrap_or_default();
         let flow = flows.get(&price).copied().unwrap_or_default();
@@ -1037,6 +1447,8 @@ mod tests {
             grouping: Grouping::Hundred,
             window_secs: 600,
             units: Units::Quote,
+            compact: true,
+            trade_stream: true,
         };
         let saved = serde_json::to_string(&pane).unwrap();
         let restored: crate::Pane = serde_json::from_str(&saved).unwrap();
@@ -1045,5 +1457,267 @@ mod tests {
         assert_eq!(restored.dom.grouping, Grouping::Hundred);
         assert_eq!(restored.dom.window_secs, 600);
         assert_eq!(restored.dom.units, Units::Quote);
+        assert!(restored.dom.compact);
+        assert!(restored.dom.trade_stream);
+    }
+
+    #[test]
+    fn old_dom_settings_keep_the_original_layout() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"grouping":"Ten","window_secs":120,"units":"Quote"}"#)
+                .unwrap();
+        assert!(!settings.compact);
+        assert!(!settings.trade_stream);
+        assert_eq!(settings.window_secs, 120);
+    }
+
+    #[test]
+    fn trade_rows_use_the_original_decimal_price_at_group_boundaries() {
+        let mut data = MarketData::default();
+        data.push_trade(trade("0.620999999999999999", "1", 100, TradeSide::Buy));
+        let point = data.price_trades.front().unwrap();
+        assert_eq!(point.price, 0.621); // Float rounding must not move this fill up a DOM row.
+        let body = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::splat(300.0));
+        let top = "0.622".parse().unwrap();
+        let step = "0.001".parse().unwrap();
+        assert_eq!(
+            level_y(point.exact_price.unwrap(), top, step, body),
+            body.top() + 2.5 * ROW_HEIGHT
+        );
+        assert_eq!(
+            level_y("0.621".parse().unwrap(), top, step, body),
+            body.top() + 1.5 * ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn all_dom_layout_combinations_keep_trade_dots_aligned_with_price_cells() {
+        let mut data = MarketData::default();
+        data.book = Some(Book {
+            bids: vec![level("101", "2")],
+            asks: vec![level("102", "3")],
+            updated_at_ms: crate::utc_now_ms(),
+        });
+        data.push_trade(Trade {
+            price: "101".into(),
+            size: "1".into(),
+            time_ms: crate::utc_now_ms() - 500,
+            side: TradeSide::Buy,
+        });
+        let account = Account {
+            exchange: terminal_core::Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        let orders: Vec<_> = [
+            ("101.25", TradeSide::Buy),
+            ("101.75", TradeSide::Buy),
+            ("101.50", TradeSide::Sell),
+            ("102", TradeSide::Sell),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (price, side))| OwnOrder {
+            coin: "BTC".into(),
+            order_id: index as u64,
+            side,
+            price: price.into(),
+            size: "1".into(),
+        })
+        .collect();
+        let own_orders: Vec<_> = orders.iter().map(|order| (&account, order)).collect();
+        for compact in [false, true] {
+            for trade_stream in [false, true] {
+                let ctx = egui::Context::default();
+                let settings = Settings {
+                    compact,
+                    trade_stream,
+                    ..Default::default()
+                };
+                let mut view = View::default();
+                let mut render = || {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(800.0, 600.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            super::ui(ui, Some(&data), None, &settings, &mut view, &own_orders);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                render();
+                let output = render();
+                let text: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let has = |label| text.iter().any(|text| text.galley.job.text == label);
+                assert!(has("BID") && has("PRICE") && has("ASK"));
+                assert_eq!(has("ORDERS"), !compact);
+                assert_eq!(has("SOLD"), !compact);
+                assert_eq!(has("BOUGHT"), !compact);
+                assert_eq!(has("TRADES"), trade_stream);
+                let order_lines: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::LineSegment { points, stroke }
+                            if stroke.color == GREEN.gamma_multiply(0.35)
+                                || stroke.color == RED.gamma_multiply(0.35) =>
+                        {
+                            Some((points, shape.clip_rect))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    order_lines.len(),
+                    if trade_stream { 3 } else { 0 },
+                    "same-side orders in one price row must share one line"
+                );
+                if trade_stream {
+                    let metrics = text
+                        .iter()
+                        .find(|text| text.galley.job.text.contains("SPR"))
+                        .unwrap();
+                    let ladder_header = text
+                        .iter()
+                        .find(|text| text.galley.job.text == if compact { "BID" } else { "ORDERS" })
+                        .unwrap();
+                    assert!(
+                        metrics.pos.x >= ladder_header.pos.x - 50.0,
+                        "DOM metrics must stay above the ladder, not the trade plot"
+                    );
+                    let last_price_y = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape {
+                                text.galley
+                                    .job
+                                    .text
+                                    .parse::<u32>()
+                                    .ok()
+                                    .filter(|value| *value > 80)
+                                    .map(|_| {
+                                        (text.pos.y + text.galley.size().y / 2.0)
+                                            .min(shape.clip_rect.bottom())
+                                    })
+                            } else {
+                                None
+                            }
+                        })
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        last_price_y >= 600.0 - ROW_HEIGHT,
+                        "the DOM must reach the bottom instead of reserving the trade footer: {last_price_y}"
+                    );
+                    let footer = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("UTC ·"))).unwrap();
+                    assert!(
+                        footer.clip_rect.right() < ladder_header.pos.x,
+                        "trade details must not cover DOM columns"
+                    );
+                    let price = text
+                        .iter()
+                        .find(|text| text.galley.job.text == "101")
+                        .unwrap();
+                    let price_y = price.pos.y + price.galley.size().y / 2.0;
+                    assert_eq!(
+                        order_lines
+                            .iter()
+                            .filter(|(points, _)| (points[0].y - price_y).abs() < 0.1)
+                            .count(),
+                        2,
+                        "buy and sell orders in a shared group must both remain visible"
+                    );
+                    assert!(
+                        order_lines
+                            .iter()
+                            .all(|(points, clip)| points[0].y == points[1].y
+                                && clip.contains(points[0])
+                                && clip.contains(points[1])
+                                && clip.right() < ladder_header.pos.x)
+                    );
+                    let dots: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let egui::Shape::Circle(circle) = &shape.shape {
+                                Some(circle)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    assert!(!dots.is_empty());
+                    assert!(dots.iter().all(|dot| (dot.center.y - price_y).abs() < 0.1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_trade_flow_keeps_each_side_and_price_row_without_painting_every_fill() {
+        let mut data = MarketData::default();
+        for index in 0..2000 {
+            data.push_trade(trade(
+                if index % 2 == 0 { "100" } else { "101" },
+                &(index + 1).to_string(),
+                99,
+                if index % 4 < 2 {
+                    TradeSide::Buy
+                } else {
+                    TradeSide::Sell
+                },
+            ));
+        }
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            trade_flow(
+                ui.painter(),
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 220.0)),
+                &data,
+                Decimal::from(104),
+                Decimal::ONE,
+                100_000,
+                60,
+                None,
+            );
+        });
+        output.textures_delta.clear();
+        let dots: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Circle(circle) = &shape.shape {
+                    Some(circle)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!((4..=5).contains(&dots.len()));
+        assert!(dots.iter().any(|dot| dot.fill == GREEN));
+        assert!(dots.iter().any(|dot| dot.fill == RED));
+        assert!(
+            dots.iter()
+                .any(|dot| (dot.center.y - 3.5 * ROW_HEIGHT).abs() < 0.1)
+        );
+        assert!(
+            dots.iter()
+                .any(|dot| (dot.center.y - 4.5 * ROW_HEIGHT).abs() < 0.1)
+        );
     }
 }

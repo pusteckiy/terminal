@@ -378,6 +378,7 @@ struct QuoteTick {
 struct TradePoint {
     time_ms: i64,
     price: f64,
+    exact_price: Option<Decimal>,
     size: f64,
     side: TradeSide,
 }
@@ -396,6 +397,7 @@ impl MarketData {
             let point = TradePoint {
                 time_ms: trade.time_ms,
                 price,
+                exact_price: trade.price.parse().ok(),
                 size: trade.size.parse().unwrap_or(0.0),
                 side: trade.side,
             };

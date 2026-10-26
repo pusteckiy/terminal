@@ -169,6 +169,7 @@ mod tests {
         TradePoint {
             time_ms,
             price,
+            exact_price: price.to_string().parse().ok(),
             size,
             side: TradeSide::Buy,
         }

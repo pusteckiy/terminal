@@ -17,7 +17,7 @@ const GREEN: Color32 = crate::GREEN;
 const RED: Color32 = crate::RED;
 const TAPE_ROW_HEIGHT: f32 = 21.0;
 
-fn trade_color(side: TradeSide, fallback: Color32) -> Color32 {
+pub(super) fn trade_color(side: TradeSide, fallback: Color32) -> Color32 {
     match side {
         TradeSide::Buy => GREEN,
         TradeSide::Sell => RED,
@@ -50,7 +50,7 @@ fn venue_code(exchange: Exchange) -> &'static str {
     }
 }
 
-fn trade_utc(time_ms: i64, compact: bool) -> String {
+pub(super) fn trade_utc(time_ms: i64, compact: bool) -> String {
     let day_ms = time_ms.rem_euclid(86_400_000);
     let hours = day_ms / 3_600_000;
     let minutes = day_ms / 60_000 % 60;
@@ -1274,7 +1274,7 @@ pub(super) const SERIES_COLORS: [Color32; 6] = [
     Color32::from_rgb(255, 137, 198),
 ];
 
-fn trade_dot_radius(trade: &TradePoint) -> f32 {
+pub(super) fn trade_dot_radius(trade: &TradePoint) -> f32 {
     let quote_size = trade.price * trade.size;
     if !quote_size.is_finite() || quote_size <= 0.0 {
         return 1.6;
@@ -1285,7 +1285,7 @@ fn trade_dot_radius(trade: &TradePoint) -> f32 {
 
 // Keep the first, last, high, and low observation in each horizontal pixel bucket.
 // Long windows remain cheap to draw without hiding brief price moves.
-fn simplify_points(
+pub(super) fn simplify_points(
     points: &[(i64, f64)],
     start_ms: i64,
     end_ms: i64,
