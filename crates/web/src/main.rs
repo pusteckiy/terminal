@@ -1,5 +1,6 @@
 mod audio;
 mod batch;
+mod candles;
 mod dom;
 mod fills;
 mod orderflow;
@@ -194,6 +195,7 @@ enum CompareMode {
 struct Pane {
     kind: WidgetKind,
     market: Market,
+    chart_timeframe: candles::Timeframe,
     series: Vec<Market>,
     compare_percent: bool,
     compare_mode: CompareMode,
@@ -244,6 +246,7 @@ impl Pane {
         Self {
             kind,
             market,
+            chart_timeframe: candles::Timeframe::default(),
             series,
             compare_percent: false,
             compare_mode: CompareMode::default(),
@@ -278,6 +281,8 @@ impl<'de> Deserialize<'de> for Pane {
                 kind: WidgetKind,
                 market: Market,
                 #[serde(default)]
+                chart_timeframe: candles::Timeframe,
+                #[serde(default)]
                 series: Vec<Market>,
                 #[serde(default)]
                 compare_percent: bool,
@@ -306,6 +311,7 @@ impl<'de> Deserialize<'de> for Pane {
             SavedPane::Current {
                 kind,
                 market,
+                chart_timeframe,
                 series,
                 compare_percent,
                 compare_mode,
@@ -319,6 +325,7 @@ impl<'de> Deserialize<'de> for Pane {
                 batch_symbol,
             } => {
                 let mut pane = Pane::new(kind, market);
+                pane.chart_timeframe = chart_timeframe;
                 if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
                     pane.series = series;
                 }
@@ -346,6 +353,7 @@ impl<'de> Deserialize<'de> for Pane {
 #[derive(Default)]
 struct MarketData {
     candles: Vec<Candle>,
+    trade_candles: candles::History,
     book: Option<Book>,
     best_bid_ask: Option<BestBidAsk>,
     last_price: Option<LastPrice>,
@@ -398,6 +406,7 @@ impl MarketData {
                 self.latest_trade = Some(point);
             }
             self.orderflow.push(point);
+            self.trade_candles.push(point);
             self.price_trades.push_back(point);
             let latest_ms = self
                 .last_price
@@ -2143,8 +2152,37 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 .collect();
         match pane.kind {
             WidgetKind::Chart => {
-                let candles = data.map_or(&[][..], |data| data.candles.as_slice());
-                view::chart_ui(ui, candles, &mut pane.chart, &own_orders, &positions);
+                let previous = pane.chart_timeframe;
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    egui::ComboBox::from_id_salt("chart-timeframe")
+                        .width(56.0)
+                        .selected_text(pane.chart_timeframe.label())
+                        .show_ui(ui, |ui| {
+                            for timeframe in candles::Timeframe::ALL {
+                                ui.selectable_value(&mut pane.chart_timeframe, timeframe, timeframe.label());
+                            }
+                        })
+                        .response.on_hover_text("Timeframe · UTC\n1s / 5s / 30s: built from received trades, up to 10 minutes.\nOther intervals use available 1m candle history.\nThe first and current candles may be partial; missing trades are not backfilled.");
+                });
+                if pane.chart_timeframe != previous {
+                    pane.chart = view::ChartView::default();
+                }
+                let candles = data.map_or_else(Vec::new, |data| {
+                    if pane.chart_timeframe.uses_trades() {
+                        data.trade_candles.candles(pane.chart_timeframe)
+                    } else {
+                        candles::aggregate(data.candles.iter(), pane.chart_timeframe)
+                    }
+                });
+                view::chart_ui(
+                    ui,
+                    &candles,
+                    pane.chart_timeframe,
+                    &mut pane.chart,
+                    &own_orders,
+                    &positions,
+                );
             }
             WidgetKind::Book => view::book_ui(
                 ui,
@@ -2651,6 +2689,20 @@ mod tests {
     }
 
     #[test]
+    fn chart_timeframes_persist_per_widget_and_old_layouts_default_to_one_minute() {
+        let saved = r#"{"kind":"Chart","market":{"exchange":"binance","symbol":"BTCUSDT"}}"#;
+        let mut pane: Pane = serde_json::from_str(saved).unwrap();
+        assert_eq!(pane.chart_timeframe, candles::Timeframe::M1);
+        pane.chart_timeframe = candles::Timeframe::S30;
+        let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(restored.chart_timeframe, candles::Timeframe::S30);
+        assert_eq!(
+            Pane::new(WidgetKind::Chart, pane.market).chart_timeframe,
+            candles::Timeframe::M1
+        );
+    }
+
+    #[test]
     fn saved_comparison_defaults_to_live_trades() {
         let saved = r#"{"kind":"Compare","market":{"exchange":"binance","symbol":"BTCUSDT"},"series":[{"exchange":"binance","symbol":"BTCUSDT"}],"compare_percent":false}"#;
         let pane: Pane = serde_json::from_str(saved).unwrap();
@@ -2759,6 +2811,10 @@ mod tests {
         let bucket = data.orderflow.buckets.front().unwrap();
         assert_eq!(bucket.trades, MAX_TRADE_POINTS as u64 + 1);
         assert_eq!(bucket.buy.quote, (MAX_TRADE_POINTS + 1) as f64 * 50.0);
+        assert_eq!(
+            data.trade_candles.candles(candles::Timeframe::S1)[0].volume,
+            (MAX_TRADE_POINTS + 1) as f64 * 0.5
+        );
     }
 
     #[test]

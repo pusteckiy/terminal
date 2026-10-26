@@ -353,14 +353,20 @@ pub(crate) fn quote_size_text(value: &str) -> String {
     }
 }
 
-fn time_text(timestamp: i64) -> String {
+fn time_text(timestamp: i64, show_seconds: bool) -> String {
     let minutes = timestamp.div_euclid(60).rem_euclid(1440);
-    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+    let time = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+    if show_seconds {
+        format!("{time}:{:02}", timestamp.rem_euclid(60))
+    } else {
+        time
+    }
 }
 
 pub fn chart_ui(
     ui: &mut egui::Ui,
     candles: &[Candle],
+    timeframe: crate::candles::Timeframe,
     view: &mut ChartView,
     orders: &[(&Account, &OwnOrder)],
     positions: &[(&Account, &Position)],
@@ -408,7 +414,11 @@ pub fn chart_ui(
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "Waiting for candle history…",
+            if timeframe.uses_trades() {
+                "Waiting for trades…"
+            } else {
+                "Waiting for candle history…"
+            },
             FontId::proportional(13.0),
             MUTED,
         );
@@ -431,8 +441,11 @@ pub fn chart_ui(
         return;
     }
 
+    let seconds = timeframe.seconds();
+    let last_time = candles.last().unwrap().time;
+    let slots = ((last_time - candles[0].time) / seconds + 1) as usize;
     if view.visible == 0 {
-        view.visible = 90;
+        view.visible = slots.clamp(20, 90);
     }
     if response.hovered()
         && response.hover_pos().is_some_and(|p| plot.contains(p))
@@ -444,7 +457,7 @@ pub fn chart_ui(
             view.visible = (view.visible as isize + change).clamp(20, 220) as usize;
         }
     }
-    view.clamp_offset(candles.len());
+    view.clamp_offset(slots);
     let step = plot.width() / view.visible as f32;
     if response.dragged_by(egui::PointerButton::Primary)
         && ui.input(|input| {
@@ -458,25 +471,42 @@ pub fn chart_ui(
         let moved = (view.drag_remainder / step).trunc() as isize;
         if moved != 0 {
             view.offset = view.offset.saturating_add_signed(moved);
-            view.clamp_offset(candles.len());
+            view.clamp_offset(slots);
             view.drag_remainder -= moved as f32 * step;
         }
     } else {
         view.drag_remainder = 0.0;
     }
 
-    let end = candles.len().saturating_sub(view.offset);
-    let start = end.saturating_sub(view.visible);
+    let end_time = last_time + seconds - view.offset as i64 * seconds;
+    let start_time = end_time - view.visible as i64 * seconds;
+    let start = candles.partition_point(|c| c.time < start_time);
+    let end = candles.partition_point(|c| c.time < end_time);
     let visible = &candles[start..end];
     if visible.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No trades in this range",
+            FontId::proportional(13.0),
+            MUTED,
+        );
         return;
     }
+    let x_for = |time: i64| plot.left() + (((time - start_time) / seconds) as f32 + 0.5) * step;
     let high = visible
         .iter()
         .map(|c| c.high)
         .fold(f64::NEG_INFINITY, f64::max);
     let low = visible.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
-    let padding = ((high - low) * 0.07).max(high.abs() * 0.0001);
+    let padding = ((high - low) * 0.07).max(
+        high.abs()
+            * if timeframe.uses_trades() {
+                1e-8
+            } else {
+                0.0001
+            },
+    );
     let price_area = Rect::from_min_max(
         plot.min,
         Pos2::new(plot.right(), plot.top() + plot.height() * 0.76),
@@ -531,10 +561,10 @@ pub fn chart_ui(
         .iter()
         .map(|c| c.volume)
         .fold(0.0_f64, f64::max)
-        .max(1.0);
+        .max(f64::MIN_POSITIVE);
     let bar_width = (step * 0.65).clamp(1.0, 15.0);
-    for (index, candle) in visible.iter().enumerate() {
-        let x = plot.left() + (index as f32 + 0.5) * step;
+    for candle in visible {
+        let x = x_for(candle.time);
         let color = if candle.close >= candle.open {
             GREEN
         } else {
@@ -657,13 +687,14 @@ pub fn chart_ui(
         );
     }
 
-    for tick in 0..=4 {
-        let index = ((visible.len() - 1) * tick / 4).min(visible.len() - 1);
-        let x = plot.left() + (index as f32 + 0.5) * step;
+    let intervals = (plot.width() / 80.0).floor().clamp(1.0, 4.0) as usize;
+    for tick in 0..=intervals {
+        let time = start_time + ((view.visible - 1) * tick / intervals) as i64 * seconds;
+        let x = x_for(time);
         painter.text(
             Pos2::new(x, plot.bottom() + 11.0),
             Align2::CENTER_CENTER,
-            time_text(visible[index].time),
+            time_text(time, timeframe.uses_trades()),
             FontId::monospace(10.0),
             MUTED,
         );
@@ -673,8 +704,9 @@ pub fn chart_ui(
         .hover_pos()
         .filter(|pointer| price_area.contains(*pointer))
     {
-        let index = (((pointer.x - plot.left()) / step).floor() as usize).min(visible.len() - 1);
-        let x = plot.left() + (index as f32 + 0.5) * step;
+        let slot = ((pointer.x - plot.left()) / step).floor() as i64;
+        let time = start_time + slot * seconds;
+        let x = x_for(time);
         painter.line_segment(
             [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
             Stroke::new(1.0, MUTED),
@@ -686,13 +718,16 @@ pub fn chart_ui(
             ],
             Stroke::new(1.0, MUTED),
         );
-        let c = &visible[index];
+        let index = visible.partition_point(|c| c.time < time);
+        let Some(c) = visible.get(index).filter(|c| c.time == time) else {
+            return;
+        };
         painter.text(
             Pos2::new(plot.left() + 8.0, plot.top() + 8.0),
             Align2::LEFT_TOP,
             format!(
                 "{} UTC     O {}   H {}   L {}   C {}",
-                time_text(c.time),
+                time_text(c.time, timeframe.uses_trades()),
                 price_text(c.open),
                 price_text(c.high),
                 price_text(c.low),
@@ -2218,11 +2253,19 @@ mod tests {
     use super::{
         ChartView, YAxisView, book_scroll_bounds, comparison_reference, comparison_value,
         execution_metrics, order_plot_value, own_orders_at, quote_size_text, simplify_points,
-        trade_utc,
+        time_text, trade_utc,
     };
     use crate::MarketData;
     use std::collections::HashMap;
     use terminal_core::{Account, Exchange, LastPrice, Level, Market, OwnOrder, Trade, TradeSide};
+
+    #[test]
+    fn chart_time_labels_distinguish_seconds_and_wrap_at_utc_midnight() {
+        assert_eq!(time_text(86_399, true), "23:59:59");
+        assert_eq!(time_text(86_400, true), "00:00:00");
+        assert_eq!(time_text(86_401, true), "00:00:01");
+        assert_eq!(time_text(86_399, false), "23:59");
+    }
 
     #[test]
     fn chart_history_boundary_keeps_a_full_visible_window() {
