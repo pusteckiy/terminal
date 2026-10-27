@@ -240,6 +240,8 @@ impl Pane {
                 Market::for_exchange(Exchange::Binance),
                 Market::for_exchange(Exchange::Hyperliquid),
             ]
+        } else if matches!(kind, WidgetKind::Dom) {
+            vec![market.clone()]
         } else {
             Vec::new()
         };
@@ -267,6 +269,27 @@ impl Pane {
             legacy: false,
             search: String::new(),
             editing_series: 0,
+        }
+    }
+}
+
+impl Pane {
+    fn uses_sources(&self) -> bool {
+        matches!(
+            self.kind,
+            WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom
+        )
+    }
+
+    fn swap_sources(&mut self, from: usize, to: usize) {
+        self.series.swap(from, to);
+        if self.editing_series == from {
+            self.editing_series = to;
+        } else if self.editing_series == to {
+            self.editing_series = from;
+        }
+        if matches!(self.kind, WidgetKind::Dom) {
+            self.market = self.series[0].clone();
         }
     }
 }
@@ -326,8 +349,15 @@ impl<'de> Deserialize<'de> for Pane {
             } => {
                 let mut pane = Pane::new(kind, market);
                 pane.chart_timeframe = chart_timeframe;
-                if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) && !series.is_empty() {
+                if matches!(
+                    kind,
+                    WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom
+                ) && !series.is_empty()
+                {
                     pane.series = series;
+                    if matches!(kind, WidgetKind::Dom) {
+                        pane.market = pane.series[0].clone();
+                    }
                 }
                 pane.compare_percent = compare_percent;
                 pane.compare_mode = compare_mode;
@@ -785,7 +815,7 @@ impl TerminalApp {
                     {
                         wanted.insert(pane.market.clone());
                     }
-                } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+                } else if pane.uses_sources() {
                     wanted.extend(
                         pane.series
                             .iter()
@@ -1679,40 +1709,102 @@ fn compare_editor(
     selected_source_editor(ui, pane, catalogs, errors, needed, retry);
 }
 
+fn source_move_button(ui: &mut egui::Ui, up: bool, enabled: bool) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("")
+            .small()
+            .min_size(egui::vec2(20.0, 20.0)),
+    );
+    let center = response.rect.center();
+    let direction = if up { 1.0 } else { -1.0 };
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + egui::vec2(-3.5, 2.0 * direction),
+            center + egui::vec2(0.0, -2.0 * direction),
+            center + egui::vec2(3.5, 2.0 * direction),
+        ],
+        egui::Stroke::new(
+            1.2,
+            if enabled {
+                TEXT
+            } else {
+                MUTED.gamma_multiply(0.4)
+            },
+        ),
+    ));
+    response.on_hover_text(if up {
+        "Move source up"
+    } else {
+        "Move source down"
+    })
+}
+
 fn sources_list(ui: &mut egui::Ui, pane: &mut Pane) {
     ui.label(RichText::new("SOURCES").small().color(MUTED));
     let mut remove = None;
+    let mut reorder = None;
     egui::ScrollArea::vertical()
         .id_salt("comparison-sources")
+        .max_width(280.0)
         .max_height(118.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             for (index, market) in pane.series.iter().enumerate() {
                 ui.horizontal(|ui| {
+                    let controls_width = if pane.series.len() > 1 {
+                        60.0 + ui.spacing().item_spacing.x * 3.0
+                    } else {
+                        0.0
+                    };
+                    let name = format!(
+                        "{} {}  {}",
+                        market.exchange.label(),
+                        market.kind.label(),
+                        market.symbol
+                    );
                     if ui
-                        .selectable_label(
-                            pane.editing_series == index,
-                            format!(
-                                "{} {}  {}",
-                                market.exchange.label(),
-                                market.kind.label(),
-                                market.symbol
-                            ),
+                        .add_sized(
+                            [(ui.available_width() - controls_width).max(40.0), 20.0],
+                            egui::Button::selectable(pane.editing_series == index, "")
+                                .left_text(
+                                    RichText::new(&name).color(view::venue_color(market.exchange)),
+                                )
+                                .truncate(),
                         )
+                        .on_hover_text(name)
                         .clicked()
                     {
                         pane.editing_series = index;
                         pane.search.clear();
                     }
-                    if pane.series.len() > 1 && ui.small_button("×").clicked() {
-                        remove = Some(index);
+                    if pane.series.len() > 1 {
+                        if source_move_button(ui, true, index > 0).clicked() {
+                            reorder = Some((index, index - 1));
+                        }
+                        if source_move_button(ui, false, index + 1 < pane.series.len()).clicked() {
+                            reorder = Some((index, index + 1));
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Remove source")
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
                     }
                 });
             }
         });
     if let Some(index) = remove {
         pane.series.remove(index);
+        if index < pane.editing_series {
+            pane.editing_series -= 1;
+        }
         pane.editing_series = pane.editing_series.min(pane.series.len() - 1);
         pane.search.clear();
+    } else if let Some((from, to)) = reorder {
+        pane.swap_sources(from, to);
     }
     if ui.button("+ Add source").clicked() {
         let exchange = Exchange::ALL
@@ -1925,7 +2017,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                         .get(account)
                         .is_some_and(|state| state.connected)
             })
-        } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+        } else if pane.uses_sources() {
             !pane.series.is_empty()
                 && pane
                     .series
@@ -1948,34 +2040,35 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     )
                     .sense(Sense::drag()),
                 );
-                let subtitle = if pane.unavailable_markets.contains(&pane.market)
-                    && !matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape)
-                {
-                    format!(
-                        "{} {}  {}",
-                        pane.market.exchange.label(),
-                        pane.market.kind.label(),
-                        pane.batch_symbol.as_deref().unwrap_or(&pane.market.symbol)
-                    )
-                } else if matches!(pane.kind, WidgetKind::Fills) {
-                    "Hyperliquid".to_owned()
-                } else if matches!(pane.kind, WidgetKind::Position)
-                    && pane.market.kind == MarketKind::Spot
-                {
-                    orderflow::symbol_info(&pane.market, self.catalogs).map_or_else(
-                        || format!("Hyperliquid Spot {}", pane.market.symbol),
-                        |info| format!("Hyperliquid Spot {}/{}", info.base, info.quote),
-                    )
-                } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
-                    format!("{} sources", pane.series.len())
-                } else {
-                    format!(
-                        "{} {}  {}",
-                        pane.market.exchange.label(),
-                        pane.market.kind.label(),
-                        pane.market.symbol
-                    )
-                };
+                let subtitle =
+                    if pane.unavailable_markets.contains(&pane.market) && !pane.uses_sources() {
+                        format!(
+                            "{} {}  {}",
+                            pane.market.exchange.label(),
+                            pane.market.kind.label(),
+                            pane.batch_symbol.as_deref().unwrap_or(&pane.market.symbol)
+                        )
+                    } else if matches!(pane.kind, WidgetKind::Fills) {
+                        "Hyperliquid".to_owned()
+                    } else if matches!(pane.kind, WidgetKind::Position)
+                        && pane.market.kind == MarketKind::Spot
+                    {
+                        orderflow::symbol_info(&pane.market, self.catalogs).map_or_else(
+                            || format!("Hyperliquid Spot {}", pane.market.symbol),
+                            |info| format!("Hyperliquid Spot {}/{}", info.base, info.quote),
+                        )
+                    } else if pane.uses_sources()
+                        && (!matches!(pane.kind, WidgetKind::Dom) || pane.series.len() > 1)
+                    {
+                        format!("{} sources", pane.series.len())
+                    } else {
+                        format!(
+                            "{} {}  {}",
+                            pane.market.exchange.label(),
+                            pane.market.kind.label(),
+                            pane.market.symbol
+                        )
+                    };
                 let label_width = (ui.available_width() - 72.0).max(42.0);
                 ui.add_sized(
                     [label_width, 18.0],
@@ -2042,12 +2135,17 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                     );
                                 }
                                 WidgetKind::Dom => {
+                                    let previous_sources = pane.series.len();
+                                    sources_list(ui, pane);
+                                    if previous_sources == 1 && pane.series.len() > 1 {
+                                        pane.dom.enable_multi();
+                                    }
+                                    ui.separator();
                                     dom::config_ui(ui, &mut pane.dom);
                                     ui.separator();
-                                    market_editor(
+                                    selected_source_editor(
                                         ui,
-                                        &mut pane.market,
-                                        &mut pane.search,
+                                        pane,
                                         self.catalogs,
                                         self.catalog_errors,
                                         self.needed_catalogs,
@@ -2094,6 +2192,12 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             || old_compare.2 != pane.compare_percent
         {
             if old_compare.0 != pane.series {
+                if matches!(pane.kind, WidgetKind::Dom) {
+                    if let Some(first) = pane.series.first() {
+                        pane.market = first.clone();
+                    }
+                    pane.dom_view = dom::View::default();
+                }
                 pane.unavailable_markets
                     .retain(|market| pane.series.contains(market));
             }
@@ -2113,7 +2217,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     .color(MUTED),
                 );
             }
-            if !matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+            if !pane.uses_sources() {
                 return if dragging {
                     UiResponse::DragStarted
                 } else {
@@ -2193,13 +2297,11 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 &own_orders,
             ),
             WidgetKind::Compare => {
-                if pane.orderflow.enabled {
-                    self.needed_catalogs.extend(
-                        pane.series
-                            .iter()
-                            .map(|market| (market.exchange, market.kind)),
-                    );
-                }
+                self.needed_catalogs.extend(
+                    pane.series
+                        .iter()
+                        .map(|market| (market.exchange, market.kind)),
+                );
                 let orders = if pane.compare_show_orders {
                     visible_source_orders(sources, self.account_data, self.hidden_widget_accounts)
                 } else {
@@ -2252,15 +2354,35 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Dom => {
-                self.needed_catalogs.insert((market.exchange, market.kind));
-                dom::ui(
-                    ui,
-                    data,
-                    orderflow::symbol_info(market, self.catalogs),
-                    &pane.dom,
-                    &mut pane.dom_view,
-                    &own_orders,
-                );
+                self.needed_catalogs
+                    .extend(sources.iter().map(|market| (market.exchange, market.kind)));
+                if pane.series.len() > 1 {
+                    let orders = visible_source_orders(
+                        sources,
+                        self.account_data,
+                        self.hidden_widget_accounts,
+                    );
+                    dom::multi_ui(
+                        ui,
+                        sources,
+                        self.data,
+                        self.catalogs,
+                        &pane.dom,
+                        &mut pane.dom_view,
+                        &orders,
+                    );
+                } else if sources.is_empty() {
+                    ui.weak("No available DOM sources. Choose a market in config.");
+                } else {
+                    dom::ui(
+                        ui,
+                        data,
+                        orderflow::symbol_info(market, self.catalogs),
+                        &pane.dom,
+                        &mut pane.dom_view,
+                        &own_orders,
+                    );
+                }
             }
         }
         if dragging {
@@ -2273,7 +2395,9 @@ impl Behavior<Pane> for PaneBehavior<'_> {
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         if matches!(pane.kind, WidgetKind::Fills) {
             "FILLS".into()
-        } else if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+        } else if pane.uses_sources()
+            && (!matches!(pane.kind, WidgetKind::Dom) || pane.series.len() > 1)
+        {
             format!(
                 "{} · {} sources",
                 pane.kind.short_label(),
@@ -2720,6 +2844,59 @@ mod tests {
         assert!(!restored.compare_show_orders);
         assert!(restored.orderflow.enabled);
         assert_eq!(restored.orderflow.source, Some(pane.series[0].clone()));
+    }
+
+    #[test]
+    fn dom_sources_survive_save_and_old_layouts_keep_their_market() {
+        let old = r#"{"kind":"Dom","market":{"exchange":"hyperliquid","kind":"perp","symbol":"kPEPE"},"dom":{"compact":true,"trade_stream":true}}"#;
+        let mut pane: Pane = serde_json::from_str(old).unwrap();
+        assert_eq!(pane.series, [pane.market.clone()]);
+        assert!(pane.uses_sources());
+        pane.series.push(Market {
+            exchange: Exchange::Binance,
+            kind: MarketKind::Perp,
+            symbol: "1000PEPEUSDT".into(),
+        });
+        pane.editing_series = 1;
+        pane.swap_sources(1, 0);
+        assert_eq!(pane.editing_series, 0);
+        assert_eq!(pane.market, pane.series[0]);
+        assert_eq!(pane.market.exchange, Exchange::Binance);
+        let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(restored.market, pane.market);
+        assert_eq!(restored.series, pane.series);
+    }
+
+    #[test]
+    fn reordering_sources_keeps_selection_search_and_flow_source_and_saves_order() {
+        let mut pane = Pane::new(WidgetKind::Compare, Market::default());
+        pane.series = [Exchange::Binance, Exchange::Bybit, Exchange::Okx]
+            .into_iter()
+            .map(Market::for_exchange)
+            .collect();
+        let selected = pane.series[1].clone();
+        pane.editing_series = 1;
+        pane.search = "PEPE".into();
+        pane.orderflow.source = Some(selected.clone());
+        pane.swap_sources(1, 0);
+        assert_eq!(pane.editing_series, 0);
+        pane.swap_sources(2, 1);
+        assert_eq!(pane.editing_series, 0);
+        pane.swap_sources(0, 1);
+        assert_eq!(pane.editing_series, 1);
+        assert_eq!(pane.series[pane.editing_series], selected);
+        assert_eq!(pane.search, "PEPE");
+        assert_eq!(pane.orderflow.source.as_ref(), Some(&selected));
+        assert_eq!(
+            pane.series
+                .iter()
+                .map(|market| market.exchange)
+                .collect::<Vec<_>>(),
+            [Exchange::Okx, Exchange::Bybit, Exchange::Binance]
+        );
+        let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(restored.series, pane.series);
+        assert_eq!(restored.orderflow.source, pane.orderflow.source);
     }
 
     #[test]

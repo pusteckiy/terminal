@@ -67,7 +67,7 @@ fn restore(app: &mut TerminalApp, undo: Undo) {
 
 fn sources(pane: &Pane) -> &[Market] {
     match pane.kind {
-        WidgetKind::Compare | WidgetKind::Tape => &pane.series,
+        WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom => &pane.series,
         WidgetKind::Fills => &[], // An account-wide log keeps its explicit filters.
         _ => std::slice::from_ref(&pane.market),
     }
@@ -107,7 +107,9 @@ fn candidates(from: &Market, base: &str, catalog: &[SymbolInfo]) -> Vec<Market> 
     catalog
         .iter()
         .filter(|info| {
-            info.base.eq_ignore_ascii_case(base)
+            orderflow::base_units(&info.base, from.kind)
+                .0
+                .eq_ignore_ascii_case(base)
                 && quote.is_some_and(|quote| info.quote.eq_ignore_ascii_case(quote))
         })
         .map(|info| Market {
@@ -183,7 +185,7 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
                 })
             })
             .collect();
-        if matches!(pane.kind, WidgetKind::Compare | WidgetKind::Tape) {
+        if pane.uses_sources() {
             if let Some(index) = pane
                 .orderflow
                 .source
@@ -193,6 +195,11 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
                 pane.orderflow.source = Some(next[index].clone());
             }
             pane.series = next;
+            if matches!(pane.kind, WidgetKind::Dom)
+                && let Some(first) = pane.series.first()
+            {
+                pane.market = first.clone();
+            }
         } else {
             pane.market = next[0].clone();
         }
@@ -242,8 +249,8 @@ pub fn ui(app: &mut TerminalApp, ctx: &egui::Context) {
                 }
                 let query = dialog.query.trim().to_ascii_uppercase();
                 if dialog.selected.is_none() && ready {
-                    let mut bases: Vec<_> = from.iter().flat_map(|market| app.catalogs.get(&(market.exchange, market.kind)).into_iter().flatten())
-                        .map(|info| info.base.to_ascii_uppercase()).filter(|base| query.is_empty() || base.contains(&query)).collect();
+                    let mut bases: Vec<_> = from.iter().flat_map(|market| app.catalogs.get(&(market.exchange, market.kind)).into_iter().flatten()
+                        .map(move |info| orderflow::base_units(&info.base, market.kind).0.to_ascii_uppercase())).filter(|base| query.is_empty() || base.contains(&query)).collect();
                     bases.sort_unstable(); bases.dedup();
                     if bases.is_empty() { ui.label(RichText::new("No matching symbols").color(MUTED)); }
                     let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -349,6 +356,47 @@ mod tests {
             kind: MarketKind::Perp,
             symbol: symbol.into(),
         }
+    }
+
+    #[test]
+    fn batch_changes_every_dom_source_resolves_bundles_and_undo_restores() {
+        let mut app = crate::tests::test_app();
+        let binance = market(Exchange::Binance, "BTCUSDT");
+        let hl = market(Exchange::Hyperliquid, "BTC");
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Perp),
+            vec![
+                info("BTCUSDT", "BTC", "USDT"),
+                info("1000PEPEUSDT", "1000PEPE", "USDT"),
+            ],
+        );
+        app.catalogs.insert(
+            (Exchange::Hyperliquid, MarketKind::Perp),
+            vec![info("BTC", "BTC", "USDC"), info("kPEPE", "kPEPE", "USDC")],
+        );
+        let mut pane = Pane::new(WidgetKind::Dom, binance.clone());
+        pane.series = vec![binance, hl];
+        let mut tiles = Tiles::default();
+        let id = tiles.insert_pane(pane);
+        app.workspaces[0] = Tree::new("multi-dom", id, tiles);
+        let before = serde_json::to_string(&app.workspaces).unwrap();
+        assert_eq!(apply(&mut app, &Dialog::new(0), "PEPE", 0.0), 1);
+        let pane = app.workspaces[0].tiles.get_pane(&id).unwrap();
+        assert_eq!(
+            pane.series
+                .iter()
+                .map(|market| market.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["1000PEPEUSDT", "kPEPE"]
+        );
+        assert_eq!(pane.market, pane.series[0]);
+        assert!(pane.unavailable_markets.is_empty());
+        app.socket_open = true;
+        app.sync_subscriptions();
+        assert_eq!(app.subscribed.len(), 2);
+        let undo = app.batch_undo.take().unwrap();
+        restore(&mut app, undo);
+        assert_eq!(serde_json::to_string(&app.workspaces).unwrap(), before);
     }
 
     #[test]

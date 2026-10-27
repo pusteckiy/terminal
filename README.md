@@ -25,6 +25,8 @@ Enable **Show orderflow** in PRICES config for buy/sell quote volume grouped int
 
 DOM config has independent **Compact DOM** and **Show trade flow** switches. Compact mode shows BID / PRICE / ASK. Trade flow adds a rolling price trace on the left with buy/sell dots sized by trade notional; every price step aligns with a fixed DOM row. Visible accounts' open orders appear as horizontal buy/sell lines, grouped once per row and side. Both sides share scrolling, centering, price grouping, and the trade window. DOM metrics sit above the ladder, which uses the full widget height; the time axis and trade details stay beneath the left plot. Hover a dot for UTC time, price, and base/quote size. Dense tape retains the largest fill per pixel, price row, and side. Settings are saved per widget; both switches are off by default.
 
+Add sources in DOM config to compare the same coin across exchanges on one price ladder. Compact mode uses one liquidity column per source; regular mode shows BID and ASK separately. The optional trade flow shares the ladder’s price rows, with a colored line per venue and buy/sell dots. Click a venue in the legend to hide/show its data; hover highlights its trace and column. **Total liquidity** sums visible, unique sources with matching market type and quote currency. Missing book coverage or a disconnected source shows `—`, not zero. Bundle prices and base sizes (`1000PEPE`, `kPEPE`) are normalized per coin. Different quote currencies are displayed without FX conversion and are never summed. Sources and settings survive reloads and terminal switching; the terminal’s batch symbol action updates every DOM source.
+
 **CHART** has a per-widget timeframe selector: **1s, 5s, 30s, 1m, 5m, 15m, 30m, 1h**. Second candles use received trades on every exchange, with up to 10 minutes of in-memory history from the subscription. Larger intervals aggregate the available 1m history. Buckets align to UTC and update live; the first and current candles may be partial. Missing periods stay blank; second candles are not reconstructed from minute candles or backfilled after a disconnect. No extra exchange requests are made.
 
 **FILLS** streams individual Hyperliquid account executions, including partial fills, with maker/taker, fees, and base/quote size details on hover. Filter visible accounts and symbols in config. Enable **Show markout** for editable horizons from 100 ms to 600 seconds (defaults: 1, 5, 30 seconds), in bp or percent. Markout uses the same venue’s mid-price at each horizon, signed by fill side and gross of fees. Completed measurements are fixed. `…` means pending; `—` means no valid observed quote. Quotes older than two seconds, observations started after the horizon, and missing history are excluded. Click a fill to expand its measured-horizon graph. Fills survive reconnect replay without duplicates; the latest 1,000 executions per account are kept in memory.
@@ -33,9 +35,13 @@ DOM config has independent **Compact DOM** and **Show trade flow** switches. Com
 
 Drag CHART or PRICES vertically to move the price range. Scroll over the right price scale to zoom it, or use Shift + scroll over CHART; PRICES also supports scrolling over the plot. Double-click the price scale to restore automatic scaling.
 
+PRICES automatically converts perpetual bundle prices such as `1000PEPE` and `kPEPE` to a price per underlying coin. LAST, BID/ASK, trade markers, order overlays, and percentage comparisons share that scale; base volumes are multiplied by the bundle size and quote volumes stay unchanged. Single-source DOM and other widgets keep the exchange’s native units.
+
 In PRICES Last trades mode, **Compare % change** uses the first source's latest trade as the shared reference: `(price − reference) / reference × 100`. The first source's latest trade is 0%; all chart history, trade markers, and account orders use that same current reference. The source list shows each venue's latest difference in percent.
 
 <img src="docs/screenshots/market-selection.jpg" alt="Per-widget exchange, market type, and symbol selection" width="520">
+
+Use the up/down controls beside sources in widget config to change their order. Exchange colors stay consistent across PRICES and DOM regardless of ordering. In percentage comparison mode, the first source remains the reference.
 
 ## Run locally
 

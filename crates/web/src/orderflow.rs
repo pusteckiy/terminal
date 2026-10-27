@@ -134,6 +134,31 @@ pub fn symbol_info<'a>(
         .find(|info| info.symbol == market.symbol)
 }
 
+pub fn base_units(base: &str, kind: MarketKind) -> (&str, u64) {
+    if base.eq_ignore_ascii_case("XBT") {
+        return ("BTC", 1);
+    }
+    if kind == MarketKind::Perp {
+        if let Some(coin) = base.strip_prefix('k')
+            && coin.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        {
+            return (coin, 1_000);
+        }
+        let digits = base.bytes().take_while(u8::is_ascii_digit).count();
+        let (prefix, coin) = base.split_at(digits);
+        // Only explicit powers of ten are bundle prefixes; 1INCH and KAS are assets.
+        if !coin.is_empty()
+            && prefix.starts_with('1')
+            && prefix.len() >= 4
+            && prefix[1..].bytes().all(|byte| byte == b'0')
+            && let Ok(multiplier) = prefix.parse()
+        {
+            return (coin, multiplier);
+        }
+    }
+    (base, 1)
+}
+
 // Different quote currencies are not interchangeable. In Base mode only the asset
 // must match; adapters already normalize contract quantities to base units.
 pub fn compatible(
@@ -149,7 +174,9 @@ pub fn compatible(
     };
     markets.iter().all(|market| {
         symbol_info(market, catalogs).is_some_and(|info| {
-            info.base.eq_ignore_ascii_case(&first.base)
+            base_units(&info.base, market.kind)
+                .0
+                .eq_ignore_ascii_case(base_units(&first.base, markets[0].kind).0)
                 && (units == Units::Base || info.quote.eq_ignore_ascii_case(&first.quote))
         })
     })
@@ -159,6 +186,7 @@ pub fn collect(
     markets: &[Market],
     source: Option<&Market>,
     data: &HashMap<Market, MarketData>,
+    catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     start_ms: i64,
     end_ms: i64,
 ) -> Vec<Bucket> {
@@ -175,9 +203,20 @@ pub fn collect(
         .filter(|market| source.is_none_or(|selected| selected == *market))
     {
         if let Some(data) = data.get(market) {
+            let multiplier = symbol_info(market, catalogs)
+                .map_or(1, |info| base_units(&info.base, market.kind).1)
+                as f64;
             for bucket in &data.orderflow.buckets {
                 if (start..=end).contains(&bucket.second) {
-                    result[(bucket.second - start) as usize].add(bucket);
+                    let mut normalized = *bucket;
+                    for volume in [
+                        &mut normalized.buy,
+                        &mut normalized.sell,
+                        &mut normalized.unknown,
+                    ] {
+                        volume.base *= multiplier;
+                    }
+                    result[(bucket.second - start) as usize].add(&normalized);
                 }
             }
         }
@@ -188,6 +227,68 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundles_normalize_base_volume_without_changing_quote_notional() {
+        assert_eq!(base_units("XBT", MarketKind::Perp), ("BTC", 1));
+        assert_eq!(base_units("XBT", MarketKind::Spot), ("BTC", 1));
+        for (base, expected, multiplier) in [
+            ("1000PEPE", "PEPE", 1_000),
+            ("kPEPE", "PEPE", 1_000),
+            ("1000000MOG", "MOG", 1_000_000),
+            ("10000SATS", "SATS", 10_000),
+            ("1INCH", "1INCH", 1),
+            ("KAS", "KAS", 1),
+            ("KAVA", "KAVA", 1),
+            ("kaito", "kaito", 1),
+            ("123TOKEN", "123TOKEN", 1),
+            ("PEPE", "PEPE", 1),
+        ] {
+            assert_eq!(base_units(base, MarketKind::Perp), (expected, multiplier));
+            assert_eq!(base_units(base, MarketKind::Spot), (base, 1));
+        }
+        let mut markets = Vec::new();
+        let mut catalogs = HashMap::new();
+        let mut data = HashMap::new();
+        for (exchange, base, price, size) in [
+            (Exchange::Binance, "1000PEPE", 0.004, 2.0),
+            (Exchange::Hyperliquid, "kPEPE", 0.004, 2.0),
+            (Exchange::Okx, "PEPE", 0.000004, 2000.0),
+        ] {
+            let market = Market {
+                exchange,
+                kind: MarketKind::Perp,
+                symbol: base.into(),
+            };
+            catalogs.insert(
+                (exchange, market.kind),
+                vec![SymbolInfo {
+                    symbol: base.into(),
+                    base: base.into(),
+                    quote: "USDT".into(),
+                    base_token_id: None,
+                    market_id: None,
+                    size_multiplier: None,
+                    price_step: None,
+                }],
+            );
+            let mut feed = MarketData::default();
+            for side in [TradeSide::Buy, TradeSide::Sell, TradeSide::Unknown] {
+                feed.orderflow.push(trade(1_000, price, size, side));
+            }
+            data.insert(market.clone(), feed);
+            markets.push(market);
+        }
+        assert!(compatible(&markets, &catalogs, Units::Quote));
+        for source in [None, Some(&markets[0])] {
+            let buckets = collect(&markets, source, &data, &catalogs, 1_000, 1_000);
+            let count = if source.is_some() { 1.0 } else { 3.0 };
+            for volume in [buckets[0].buy, buckets[0].sell, buckets[0].unknown] {
+                assert_eq!(volume.base, 2000.0 * count);
+                assert!((volume.quote - 0.008 * count).abs() < 1e-12);
+            }
+        }
+    }
 
     fn trade(time_ms: i64, price: f64, size: f64, side: TradeSide) -> TradePoint {
         TradePoint {
@@ -247,12 +348,19 @@ mod tests {
             feed.orderflow.push(trade(1_700, 10.0, 2.0, side));
             data.insert(market.clone(), feed);
         }
-        let buckets = collect(&markets, None, &data, 1_000, 3_500);
+        let buckets = collect(&markets, None, &data, &HashMap::new(), 1_000, 3_500);
         assert_eq!(buckets.len(), 3);
         assert_eq!(buckets[0].buy.quote, 20.0);
         assert_eq!(buckets[0].sell.quote, 20.0);
         assert_eq!(buckets[1].trades, 0);
-        let selected = collect(&markets, Some(&markets[0]), &data, 1_000, 3_500);
+        let selected = collect(
+            &markets,
+            Some(&markets[0]),
+            &data,
+            &HashMap::new(),
+            1_000,
+            3_500,
+        );
         assert_eq!(selected[0].delta(Units::Quote), 20.0);
         assert_eq!(selected[0].trades, 1);
     }

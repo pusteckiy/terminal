@@ -5,6 +5,9 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use terminal_core::{Account, Book, OwnOrder, SymbolInfo, Trade, TradeSide};
 
+mod multi;
+pub use multi::ui as multi_ui;
+
 use crate::{
     BORDER, GREEN, MUTED, MarketData, RED, SURFACE, TEXT, TradePoint,
     view::{quote_size_text, simplify_points, trade_color, trade_dot_radius, trade_utc},
@@ -51,6 +54,7 @@ pub struct Settings {
     units: Units,
     compact: bool,
     trade_stream: bool,
+    total_liquidity: bool,
 }
 
 impl Default for Settings {
@@ -61,7 +65,15 @@ impl Default for Settings {
             units: Units::Base,
             compact: false,
             trade_stream: false,
+            total_liquidity: false,
         }
+    }
+}
+
+impl Settings {
+    pub fn enable_multi(&mut self) {
+        self.compact = true;
+        self.trade_stream = true;
     }
 }
 
@@ -69,6 +81,8 @@ pub fn config_ui(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(&mut settings.compact, "Compact DOM");
     ui.checkbox(&mut settings.trade_stream, "Show trade flow")
         .on_hover_text("Show live trades to the left, aligned to the DOM price rows. Both sides scroll together and use the same price grouping and trade window.");
+    ui.checkbox(&mut settings.total_liquidity, "Total liquidity")
+        .on_hover_text("Sum visible venues with the same asset, market type and quote currency. Unavailable or uncovered depth is shown as —.");
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("Price grouping");
@@ -290,6 +304,7 @@ pub struct View {
     step: Option<Decimal>,
     following: bool,
     scroll_remainder: f32,
+    hidden_sources: std::collections::HashSet<terminal_core::Market>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -370,6 +385,10 @@ fn trade_flow<'a>(
     now_ms: i64,
     window: u32,
     pointer: Option<Pos2>,
+    multiplier: Decimal,
+    color: Color32,
+    axes: bool,
+    dim: bool,
 ) -> Option<&'a TradePoint> {
     // Match the ladder's UTC-second window, including expiration while idle.
     let start_ms = (now_ms.div_euclid(1_000) - i64::from(window) + 1) * 1_000;
@@ -386,7 +405,7 @@ fn trade_flow<'a>(
         })
         .filter_map(|trade| {
             let price = trade.exact_price.filter(|price| *price > Decimal::ZERO)?;
-            let y = level_y(price, top_price, step, plot);
+            let y = level_y(price / multiplier, top_price, step, plot);
             Some((
                 trade,
                 Pos2::new(
@@ -401,27 +420,29 @@ fn trade_flow<'a>(
     }
     let plot_painter = painter.with_clip_rect(plot);
     let intervals = (plot.width() / 90.0).floor().clamp(1.0, 8.0) as i64;
-    for tick in 0..=intervals {
-        let time = start_ms + (end_ms - start_ms) * tick / intervals;
-        let x = x_for(time);
-        plot_painter.line_segment(
-            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-            Stroke::new(0.5, BORDER.gamma_multiply(0.65)),
-        );
-        if plot.width() >= 130.0 || tick == intervals {
-            painter.text(
-                Pos2::new(x, plot.bottom() + 12.0),
-                if tick == 0 {
-                    Align2::LEFT_CENTER
-                } else if tick == intervals {
-                    Align2::RIGHT_CENTER
-                } else {
-                    Align2::CENTER_CENTER
-                },
-                trade_utc(time, true),
-                FontId::monospace(9.0),
-                MUTED,
+    if axes {
+        for tick in 0..=intervals {
+            let time = start_ms + (end_ms - start_ms) * tick / intervals;
+            let x = x_for(time);
+            plot_painter.line_segment(
+                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                Stroke::new(0.5, BORDER.gamma_multiply(0.65)),
             );
+            if plot.width() >= 130.0 || tick == intervals {
+                painter.text(
+                    Pos2::new(x, plot.bottom() + 12.0),
+                    if tick == 0 {
+                        Align2::LEFT_CENTER
+                    } else if tick == intervals {
+                        Align2::RIGHT_CENTER
+                    } else {
+                        Align2::CENTER_CENTER
+                    },
+                    trade_utc(time, true),
+                    FontId::monospace(9.0),
+                    MUTED,
+                );
+            }
         }
     }
     let line: Vec<_> = points
@@ -434,7 +455,10 @@ fn trade_flow<'a>(
             line.into_iter()
                 .map(|(time, y)| Pos2::new(x_for(time), y as f32))
                 .collect(),
-            Stroke::new(1.0, MUTED.gamma_multiply(0.55)),
+            Stroke::new(
+                if dim { 0.7 } else { 1.2 },
+                color.gamma_multiply(if dim { 0.2 } else { 0.65 }),
+            ),
         ));
     }
     let draw = |trade: &TradePoint, pos: Pos2| {
@@ -442,7 +466,7 @@ fn trade_flow<'a>(
             plot_painter.circle_filled(
                 pos,
                 trade_dot_radius(trade),
-                trade_color(trade.side, MUTED),
+                trade_color(trade.side, color).gamma_multiply(if dim { 0.25 } else { 1.0 }),
             );
         }
     };
@@ -1005,6 +1029,10 @@ pub fn ui(
             utc_ms,
             window,
             response.hover_pos(),
+            Decimal::ONE,
+            MUTED,
+            true,
+            false,
         )
         .or_else(|| {
             if response.hover_pos().is_none() {
@@ -1449,6 +1477,7 @@ mod tests {
             units: Units::Quote,
             compact: true,
             trade_stream: true,
+            total_liquidity: false,
         };
         let saved = serde_json::to_string(&pane).unwrap();
         let restored: crate::Pane = serde_json::from_str(&saved).unwrap();
@@ -1694,6 +1723,10 @@ mod tests {
                 100_000,
                 60,
                 None,
+                Decimal::ONE,
+                MUTED,
+                true,
+                false,
             );
         });
         output.textures_delta.clear();
