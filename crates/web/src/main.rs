@@ -5,6 +5,7 @@ mod dom;
 mod fills;
 mod orderflow;
 mod position;
+mod socket;
 mod view;
 
 use std::{
@@ -15,7 +16,7 @@ use std::{
 
 use eframe::egui::{self, Color32, RichText, Sense};
 use egui_tiles::{Behavior, Container, Linear, LinearDir, Tile, TileId, Tiles, Tree, UiResponse};
-use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
+use ewebsock::{WsEvent, WsMessage, WsSender};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 use terminal_core::{
@@ -35,6 +36,8 @@ const MUTED: Color32 = Color32::from_rgb(163, 163, 163);
 const GREEN: Color32 = Color32::from_rgb(93, 213, 172);
 const RED: Color32 = Color32::from_rgb(239, 111, 123);
 const MAX_PRICE_HISTORY_MS: i64 = 600_000;
+const SOCKET_EVENTS_PER_PASS: usize = 256;
+const SOCKET_BUDGET_MS: u64 = 4;
 const MAX_TRADE_POINTS: usize = 200_000;
 const MAX_QUOTE_SAMPLES: usize = 12_100;
 const MAX_TAPE_TRADES: usize = 500;
@@ -471,6 +474,13 @@ impl MarketData {
     }
 
     fn set_book(&mut self, mut book: Book, exchange: Exchange) {
+        if self
+            .book
+            .as_ref()
+            .is_some_and(|previous| book.updated_at_ms < previous.updated_at_ms)
+        {
+            return;
+        }
         // REST/WS snapshots carry only price and base size. Derive quote sizes
         // and cumulative depth locally, once, preserving Decimal precision.
         for levels in [&mut book.bids, &mut book.asks] {
@@ -519,6 +529,9 @@ impl MarketData {
         let Some(book) = self.book.as_mut() else {
             return;
         };
+        if updated_at_ms < book.updated_at_ms {
+            return;
+        }
         apply_book_side(&mut book.bids, bids, true);
         apply_book_side(&mut book.asks, asks, false);
         book.updated_at_ms = updated_at_ms;
@@ -651,8 +664,9 @@ struct TerminalApp {
     focused: Option<TileId>,
     socket_open: bool,
     sender: Option<WsSender>,
-    receiver: Option<WsReceiver>,
-    reconnect_at: f64,
+    receiver: Option<socket::Inbox>,
+    reconnect_at: u64,
+    resync_on_visible: bool,
 }
 
 impl TerminalApp {
@@ -738,7 +752,8 @@ impl TerminalApp {
             socket_open: false,
             sender: None,
             receiver: None,
-            reconnect_at: 0.0,
+            reconnect_at: 0,
+            resync_on_visible: false,
         };
         app.connect(&cc.egui_ctx);
         app
@@ -764,10 +779,7 @@ impl TerminalApp {
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
-        let wake = ctx.clone();
-        match ewebsock::connect_with_wakeup(ws_url(), ewebsock::Options::default(), move || {
-            wake.request_repaint()
-        }) {
+        match socket::connect(ws_url(), ctx) {
             Ok((sender, receiver)) => {
                 self.sender = Some(sender);
                 self.receiver = Some(receiver);
@@ -920,7 +932,25 @@ impl TerminalApp {
     }
 
     fn poll_socket(&mut self, ctx: &egui::Context) {
-        while let Some(event) = self.receiver.as_ref().and_then(WsReceiver::try_recv) {
+        let started = socket::now_ms();
+        if self
+            .receiver
+            .as_ref()
+            .is_some_and(|receiver| receiver.needs_resync(started))
+        {
+            self.disconnect(ctx);
+            self.reconnect_at = started;
+            self.resync_on_visible = ctx.input(|input| input.viewport().visible() == Some(false));
+            return;
+        }
+        for index in 0..SOCKET_EVENTS_PER_PASS {
+            // A snapshot/delta message stays atomic; yield between messages.
+            if index > 0 && socket::now_ms().saturating_sub(started) >= SOCKET_BUDGET_MS {
+                break;
+            }
+            let Some(event) = self.receiver.as_ref().and_then(socket::Inbox::try_recv) else {
+                break;
+            };
             match event {
                 WsEvent::Opened => {
                     self.socket_open = true;
@@ -1065,26 +1095,38 @@ impl TerminalApp {
                     }
                 }
                 WsEvent::Closed | WsEvent::Error(_) => {
-                    self.audio.clear_pending();
-                    self.socket_open = false;
-                    self.subscribed.clear();
-                    self.subscribed_accounts.clear();
-                    self.account_data.clear();
-                    for data in self.data.values_mut() {
-                        data.connected = false;
-                        data.book = None;
-                        data.best_bid_ask = None;
-                        data.fill_quotes = fills::QuoteHistory::default();
-                    }
-                    self.record_positions(None);
-                    self.sender = None;
-                    self.receiver = None;
-                    self.reconnect_at = ctx.input(|input| input.time) + 3.0;
+                    self.disconnect(ctx);
                     break;
                 }
                 _ => {}
             }
         }
+        if self
+            .receiver
+            .as_ref()
+            .is_some_and(socket::Inbox::has_pending)
+        {
+            ctx.request_repaint();
+        }
+    }
+
+    fn disconnect(&mut self, ctx: &egui::Context) {
+        self.audio.clear_pending();
+        self.socket_open = false;
+        self.subscribed.clear();
+        self.subscribed_accounts.clear();
+        self.account_data.clear();
+        for data in self.data.values_mut() {
+            data.connected = false;
+            data.book = None;
+            data.best_bid_ask = None;
+            data.fill_quotes = fills::QuoteHistory::default();
+        }
+        self.record_positions(None);
+        self.sender = None;
+        self.receiver = None;
+        self.reconnect_at = socket::now_ms() + 3_000;
+        ctx.request_repaint_after(Duration::from_secs(3));
     }
 
     fn header(&mut self, ui: &mut egui::Ui) -> Option<WidgetKind> {
@@ -2425,18 +2467,32 @@ impl Behavior<Pane> for PaneBehavior<'_> {
 }
 
 impl eframe::App for TerminalApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_socket(ctx);
+        let visible = ctx.input(|input| input.viewport().visible() != Some(false));
+        if self.resync_on_visible && !visible {
+            self.audio.clear_pending();
+            return;
+        }
+        self.resync_on_visible = false;
+        let now = socket::now_ms();
+        if self.receiver.is_none() && now >= self.reconnect_at {
+            self.reconnect_at = now + 3_000;
+            self.connect(ctx);
+        }
+        if self.receiver.is_none() {
+            ctx.request_repaint_after(Duration::from_millis(
+                self.reconnect_at.saturating_sub(now).max(1),
+            ));
+        }
+        if !visible {
+            self.audio.clear_pending();
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if ui.visuals().window_fill != terminal_visuals().window_fill {
             ui.ctx().set_visuals(terminal_visuals());
-        }
-        self.poll_socket(ui.ctx());
-        let time = ui.ctx().input(|input| input.time);
-        if self.receiver.is_none() && time >= self.reconnect_at {
-            self.reconnect_at = time + 3.0;
-            self.connect(ui.ctx());
-        }
-        if self.receiver.is_none() {
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
         self.handle_workspace_shortcuts(ui.ctx());
 
@@ -2552,6 +2608,253 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn deferred_socket_backlog_yields_before_blocking_a_frame() {
+        let mut app = test_app();
+        let market = Market::default();
+        app.subscribed.insert(market.clone());
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        let text = serde_json::to_string(&ServerMessage::Trades {
+            market: market.clone(),
+            trades: vec![Trade {
+                time_ms: 1_000,
+                price: "100".into(),
+                size: "1".into(),
+                side: TradeSide::Buy,
+            }],
+        })
+        .unwrap();
+        for _ in 0..10_000 {
+            assert!(on_event(WsEvent::Message(WsMessage::Text(text.clone()))).is_continue());
+        }
+        let started = std::time::Instant::now();
+        app.poll_socket(&egui::Context::default());
+        let processed = app
+            .data
+            .get(&market)
+            .map_or(0, |data| data.price_trades.len());
+        eprintln!(
+            "deferred 10000 messages: one poll processed {processed} in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            processed > 0 && processed <= 256,
+            "a deferred socket queue must yield to UI instead of draining in one frame"
+        );
+        while app
+            .receiver
+            .as_ref()
+            .is_some_and(socket::Inbox::has_pending)
+        {
+            app.poll_socket(&egui::Context::default());
+        }
+        assert_eq!(
+            app.data[&market].price_trades.len(),
+            10_000,
+            "yielding must not lose trades"
+        );
+    }
+
+    #[test]
+    fn hidden_logic_consumes_feed_without_rendering_ui() {
+        let mut app = test_app();
+        let market = Market::default();
+        app.subscribed.insert(market.clone());
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        let message = ServerMessage::Trades {
+            market: market.clone(),
+            trades: vec![Trade {
+                time_ms: 1_000,
+                price: "100".into(),
+                size: "1".into(),
+                side: TradeSide::Buy,
+            }],
+        };
+        assert!(
+            on_event(WsEvent::Message(WsMessage::Text(
+                serde_json::to_string(&message).unwrap()
+            )))
+            .is_continue()
+        );
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .occluded = Some(true);
+        let _ = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert_eq!(
+            app.data.get(&market).map(|data| data.price_trades.len()),
+            Some(1),
+            "hidden logic must consume market data without calling ui"
+        );
+    }
+
+    #[test]
+    fn overflow_invalidates_books_and_recovers_only_from_a_fresh_snapshot() {
+        let mut app = test_app();
+        let market = Market::default();
+        app.socket_open = true;
+        app.subscribed.insert(market.clone());
+        app.data.insert(
+            market.clone(),
+            MarketData {
+                connected: true,
+                book: Some(Book {
+                    bids: Vec::new(),
+                    asks: Vec::new(),
+                    updated_at_ms: 1,
+                }),
+                ..Default::default()
+            },
+        );
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        assert!(
+            on_event(WsEvent::Message(WsMessage::Binary(vec![
+                0;
+                17 * 1024 * 1024
+            ])))
+            .is_break()
+        );
+        let ctx = egui::Context::default();
+        app.poll_socket(&ctx);
+        assert!(app.receiver.is_none());
+        assert!(!app.data[&market].connected);
+        assert!(app.data[&market].book.is_none());
+        assert!(on_event(WsEvent::Opened).is_break());
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        assert!(on_event(WsEvent::Opened).is_continue());
+        let level = |price: &str| Level {
+            price: price.into(),
+            size: "1".into(),
+            quote_size: String::new(),
+            depth_base: String::new(),
+            depth_quote: String::new(),
+        };
+        let snapshot = ServerMessage::Snapshot {
+            market: market.clone(),
+            candles: Vec::new(),
+            book: Some(Book {
+                bids: vec![level("100")],
+                asks: vec![level("101")],
+                updated_at_ms: 2,
+            }),
+            best_bid_ask: None,
+            last_price: None,
+            connected: true,
+        };
+        assert!(
+            on_event(WsEvent::Message(WsMessage::Text(
+                serde_json::to_string(&snapshot).unwrap()
+            )))
+            .is_continue()
+        );
+        app.poll_socket(&ctx);
+        assert!(app.data[&market].connected);
+        assert_eq!(
+            app.data[&market].book.as_ref().unwrap().bids[0].price,
+            "100"
+        );
+        let data = app.data.get_mut(&market).unwrap();
+        data.apply_book_delta(
+            vec![BookChange {
+                price: "100".into(),
+                size: "99".into(),
+            }],
+            Vec::new(),
+            1,
+            market.exchange,
+        );
+        assert_eq!(
+            data.book.as_ref().unwrap().bids[0].size,
+            "1",
+            "a delayed delta cannot roll back a newer snapshot"
+        );
+        data.set_book(
+            Book {
+                bids: Vec::new(),
+                asks: Vec::new(),
+                updated_at_ms: 1,
+            },
+            market.exchange,
+        );
+        assert_eq!(data.book.as_ref().unwrap().bids[0].price, "100");
+        data.apply_book_delta(
+            vec![BookChange {
+                price: "100".into(),
+                size: "2".into(),
+            }],
+            Vec::new(),
+            2,
+            market.exchange,
+        );
+        assert_eq!(
+            data.book.as_ref().unwrap().bids[0].size,
+            "2",
+            "updates sharing a millisecond remain valid"
+        );
+    }
+
+    #[test]
+    fn hidden_disconnect_deadline_uses_a_running_clock_not_egui_frame_time() {
+        let mut app = test_app();
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        assert!(on_event(WsEvent::Closed).is_continue());
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .occluded = Some(true);
+        let before = socket::now_ms();
+        let _ = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+        });
+        assert!(app.receiver.is_none());
+        assert!(app.reconnect_at >= before + 3_000);
+        assert!(app.reconnect_at <= socket::now_ms() + 3_000);
+    }
+
+    #[test]
+    fn hidden_overload_waits_for_visibility_instead_of_reconnecting_in_a_loop() {
+        let mut app = test_app();
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        assert!(
+            on_event(WsEvent::Message(WsMessage::Binary(vec![
+                0;
+                17 * 1024 * 1024
+            ])))
+            .is_break()
+        );
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .occluded = Some(true);
+        let _ = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+        });
+        assert!(app.resync_on_visible);
+        assert!(app.receiver.is_none());
+        let _ = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+        });
+        assert!(app.resync_on_visible);
+        assert!(app.receiver.is_none());
+    }
+
     fn pane_ids(tree: &Tree<Pane>) -> Vec<TileId> {
         tree.active_tiles()
             .into_iter()
@@ -2584,7 +2887,8 @@ mod tests {
             socket_open: false,
             sender: None,
             receiver: None,
-            reconnect_at: 0.0,
+            reconnect_at: 0,
+            resync_on_visible: false,
         }
     }
 

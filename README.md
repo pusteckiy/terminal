@@ -43,6 +43,8 @@ In PRICES Last trades mode, **Compare % change** uses the first source's latest 
 
 Use the up/down controls beside sources in widget config to change their order. Exchange colors stay consistent across PRICES and DOM regardless of ordering. In percentage comparison mode, the first source remains the reference.
 
+Market updates continue through background logic when the browser hides the tab. If suspension or overload leaves the client too far behind, it reconnects and restores current snapshots on return; hidden overload waits until the tab is visible to avoid reconnect churn. Public trades missed during a resync are not backfilled.
+
 ## Run locally
 
 Requires Rust and [Trunk](https://github.com/trunk-rs/trunk).
