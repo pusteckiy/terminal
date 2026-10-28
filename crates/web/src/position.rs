@@ -298,9 +298,13 @@ pub fn config_ui(
     errors: &HashMap<(Exchange, MarketKind), String>,
     retry: &mut HashSet<(Exchange, MarketKind)>,
 ) {
-    egui::ComboBox::from_id_salt("position-exchange")
-        .selected_text(market.exchange.label())
-        .show_ui(ui, |ui| {
+    // A ComboBox root popup replaces the enclosing widget-config menu.
+    egui::menu::SubMenuButton::new(market.exchange.label())
+        .config(
+            egui::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
             for exchange in [
                 Exchange::Hyperliquid,
                 Exchange::Binance,
@@ -905,6 +909,104 @@ fn sign_color(value: f64) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exchange_selector_stays_open_inside_position_config() {
+        fn text_rect(output: &egui::FullOutput, label: &str) -> Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == label)
+                            .then(|| Rect::from_min_size(text.pos, text.galley.size()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing {label}: POSITION config closed while opening exchange selector"
+                    )
+                })
+        }
+        fn click(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        }
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let mut market = Market::for_exchange_kind(Exchange::Okx, MarketKind::Perp);
+        let mut settings = Settings::default();
+        let mut search = String::from("old search");
+        let mut retry = HashSet::new();
+        let mut time = 0.0;
+        let mut frame = |events| {
+            time += 0.1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 900.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::menu::MenuButton::new("Config")
+                        .config(
+                            egui::menu::MenuConfig::new()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
+                            ui.set_min_width(280.0);
+                            config_ui(
+                                ui,
+                                &mut settings,
+                                &mut market,
+                                &mut search,
+                                &[],
+                                &HashSet::new(),
+                                &HashMap::new(),
+                                &HashMap::new(),
+                                &HashMap::new(),
+                                &mut retry,
+                            );
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(Vec::new());
+        let config = text_rect(&frame(Vec::new()), "Config").center();
+        for pressed in [true, false] {
+            frame(click(config, pressed));
+        }
+        frame(Vec::new());
+        let exchange = text_rect(&frame(Vec::new()), "OKX").center();
+        for pressed in [true, false] {
+            frame(click(exchange, pressed));
+        }
+        frame(Vec::new());
+        let output = frame(Vec::new());
+        text_rect(&output, "Show fills");
+        let bybit = text_rect(&output, "Bybit").center();
+        for pressed in [true, false] {
+            frame(click(bybit, pressed));
+        }
+        let output = frame(Vec::new());
+        text_rect(&output, "Show fills");
+        drop(frame);
+        assert_eq!(market.exchange, Exchange::Bybit);
+        assert_eq!(market.kind, MarketKind::Perp);
+        assert!(search.is_empty());
+    }
 
     #[test]
     fn auto_scale_fills_the_plot_with_visible_position_variation() {
