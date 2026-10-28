@@ -231,6 +231,7 @@ fn evaluate(fill: &OwnFill, horizon: u32, data: Option<&MarketData>, now: i64) -
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Selection {
+    execution_id: Option<String>,
     account: Account,
     market: Market,
     time_ms: i64,
@@ -241,6 +242,7 @@ struct Selection {
 impl Selection {
     fn new(account: &Account, fill: &OwnFill) -> Self {
         Self {
+            execution_id: fill.execution_id.clone(),
             account: account.clone(),
             market: fill.market.clone(),
             time_ms: fill.time_ms,
@@ -438,7 +440,7 @@ pub fn config_ui(
             .map(|fill| fill.market.clone())
             .collect();
         for (&(exchange, kind), symbols) in catalogs {
-            if exchange == Exchange::Hyperliquid {
+            if accounts.iter().any(|account| account.exchange == exchange) {
                 markets.extend(symbols.iter().map(|info| Market {
                     exchange,
                     kind,
@@ -628,7 +630,7 @@ pub fn ui(
                     let base = info.map_or("base", |info| info.base.as_str());
                     let quote_unit = info.map_or("quote", |info| info.quote.as_str());
                     ui.label(format!("Price {} · size {} {} · {} {}", fill.price, fill.size, base, quote, quote_unit));
-                    ui.label(format!("Fee {} {} · order #{} · fill #{}", fill.fee, fill.fee_token, fill.order_id, fill.trade_id));
+                    ui.label(format!("Fee {} {} · order #{} · fill #{}", fill.fee, fill.fee_token, fill.order_external_id.clone().unwrap_or_else(|| fill.order_id.to_string()), fill.execution_id.clone().unwrap_or_else(|| fill.trade_id.to_string())));
                     for &horizon in &horizons {
                         match view.results.get(&key).and_then(|results| results.get(&horizon)).copied().unwrap_or(Outcome::Pending) {
                             Outcome::Ready { bp, mid, age_ms } => {
@@ -796,6 +798,8 @@ mod tests {
 
     fn fill(side: TradeSide) -> OwnFill {
         OwnFill {
+            order_external_id: None,
+            execution_id: None,
             market: Market::for_exchange(Exchange::Hyperliquid),
             time_ms: 10_000,
             trade_id: 1,

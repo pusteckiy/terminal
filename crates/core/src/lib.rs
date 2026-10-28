@@ -1,3 +1,4 @@
+pub mod private;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -296,6 +297,10 @@ impl Account {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OwnOrder {
+    #[serde(default)]
+    pub kind: Option<MarketKind>,
+    #[serde(default)]
+    pub external_id: Option<String>,
     pub coin: String,
     pub order_id: u64,
     pub side: TradeSide,
@@ -303,8 +308,16 @@ pub struct OwnOrder {
     pub size: String,
 }
 
+impl OwnOrder {
+    pub fn matches_market(&self, market: &Market) -> bool {
+        self.coin == market.symbol && self.kind.is_none_or(|kind| kind == market.kind)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Position {
+    #[serde(default)]
+    pub leg: String,
     pub coin: String,
     pub size: String,
     pub entry_price: String,
@@ -323,6 +336,10 @@ pub struct SpotBalance {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OwnFill {
+    #[serde(default)]
+    pub order_external_id: Option<String>,
+    #[serde(default)]
+    pub execution_id: Option<String>,
     pub market: Market,
     pub time_ms: i64,
     pub trade_id: u64,
@@ -345,11 +362,12 @@ pub struct LivePosition {
 }
 
 impl OwnFill {
-    pub fn key(&self) -> (i64, &str, &str, u64, u64) {
+    pub fn key(&self) -> (i64, &str, &str, Option<&str>, u64, u64) {
         (
             self.time_ms,
             self.market.kind.label(),
             &self.market.symbol,
+            self.execution_id.as_deref(),
             self.trade_id,
             self.order_id,
         )
@@ -364,11 +382,17 @@ pub fn merge_account_fills(history: &mut Vec<OwnFill>, fills: Vec<OwnFill>) -> V
     let mut added = Vec::new();
     for fill in fills {
         let index = history.partition_point(|stored| stored.key() > fill.key());
-        if index >= MAX_ACCOUNT_FILLS
-            || history
-                .get(index)
-                .is_some_and(|stored| stored.key() == fill.key())
+        if index >= MAX_ACCOUNT_FILLS {
+            continue;
+        }
+        if let Some(stored) = history
+            .get_mut(index)
+            .filter(|stored| stored.key() == fill.key())
         {
+            if stored.fee.is_empty() && !fill.fee.is_empty() {
+                stored.fee = fill.fee;
+                stored.fee_token = fill.fee_token;
+            }
             continue;
         }
         added.push(fill.clone());
@@ -400,7 +424,11 @@ pub struct AccountState {
 impl AccountState {
     pub fn position_snapshot_time(&self, coin: &str) -> i64 {
         let dex = coin.split_once(':').map_or("", |(dex, _)| dex);
-        self.position_snapshot_times.get(dex).copied().unwrap_or(0)
+        self.position_snapshot_times
+            .get(coin)
+            .or_else(|| self.position_snapshot_times.get(dex))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn apply_live_position(&mut self, position: LivePosition) -> bool {
@@ -533,6 +561,8 @@ mod tests {
     #[test]
     fn account_fill_replay_is_bounded_sorted_and_keeps_partial_executions() {
         let fill = OwnFill {
+            order_external_id: None,
+            execution_id: None,
             market: Market::for_exchange(Exchange::Hyperliquid),
             time_ms: 1000,
             trade_id: 1,
@@ -551,6 +581,14 @@ mod tests {
             1
         );
         assert!(merge_account_fills(&mut history, vec![fill.clone()]).is_empty());
+        let mut missing_fee = fill.clone();
+        missing_fee.trade_id = 9;
+        missing_fee.fee.clear();
+        merge_account_fills(&mut history, vec![missing_fee.clone()]);
+        missing_fee.fee = "0.01".into();
+        assert!(merge_account_fills(&mut history, vec![missing_fee]).is_empty());
+        assert_eq!(history[0].fee, "0.01");
+        history.remove(0);
         let mut partial = fill.clone();
         partial.trade_id = 3;
         merge_account_fills(&mut history, vec![partial]);

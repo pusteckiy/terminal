@@ -3,6 +3,7 @@ mod catalog;
 mod catalog_cache;
 mod exchange;
 mod http;
+mod private;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,7 +22,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use terminal_core::{
     Account, AccountState, BestBidAsk, Book, BookChange, Candle, ClientMessage, Exchange,
@@ -646,6 +647,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dist = std::env::var("TERMINAL_WEB_DIST").unwrap_or_else(|_| "crates/web/dist".to_owned());
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route(
+            "/api/private/read",
+            post(private::read).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route("/api/private/ws", any(private::ws))
         .route("/ws", any(ws_handler))
         .fallback_service(ServeDir::new(dist));
     if std::env::var("TERMINAL_METRICS").as_deref() == Ok("1") {
@@ -699,6 +705,8 @@ mod tests {
             address: "0x1234".into(),
         };
         let fill = OwnFill {
+            order_external_id: None,
+            execution_id: None,
             market: Market::for_exchange(Exchange::Hyperliquid),
             time_ms: 1000,
             trade_id: 1,

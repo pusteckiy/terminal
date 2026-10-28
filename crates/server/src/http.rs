@@ -73,6 +73,14 @@ fn request_spacing(request: &reqwest::Request) -> Duration {
                     501..=1000 => 50,
                     _ => 250,
                 }
+            } else if path == "/api/v3/openOrders" {
+                if request.url().query_pairs().any(|(key, _)| key == "symbol") {
+                    6
+                } else {
+                    80
+                }
+            } else if path == "/api/v3/account" || path == "/api/v3/myTrades" {
+                20
             } else if path.ends_with("/exchangeInfo") {
                 20
             } else {
@@ -83,6 +91,14 @@ fn request_spacing(request: &reqwest::Request) -> Duration {
         "fapi.binance.com" => {
             let weight = if path.ends_with("/depth") {
                 20
+            } else if path == "/fapi/v1/openOrders" {
+                if request.url().query_pairs().any(|(key, _)| key == "symbol") {
+                    1
+                } else {
+                    40
+                }
+            } else if path == "/fapi/v3/positionRisk" || path == "/fapi/v1/userTrades" {
+                5
             } else if path.ends_with("/exchangeInfo") {
                 1
             } else {
@@ -140,6 +156,7 @@ impl Client {
     pub fn new() -> Self {
         Self {
             inner: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(3))
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -166,6 +183,10 @@ impl Client {
 }
 
 impl Request {
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.inner = self.inner.header(name, value);
+        self
+    }
     pub fn query<T: Serialize + ?Sized>(mut self, query: &T) -> Self {
         self.inner = self.inner.query(query);
         self

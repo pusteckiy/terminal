@@ -165,24 +165,31 @@ fn values(
         if state.positions_updated_at_ms <= 0 {
             return None;
         }
-        let mut current =
-            if let Some(position) = state.positions.iter().find(|p| p.coin == market.symbol) {
-                let size = number(&position.size)?;
-                Values {
-                    size,
-                    notional: number(&position.notional_value).map(|v| v.abs() * size.signum()),
-                    pnl: number(&position.unrealized_pnl),
-                    entry: number(&position.entry_price),
-                }
+        let positions: Vec<_> = state
+            .positions
+            .iter()
+            .filter(|p| p.coin == market.symbol)
+            .collect();
+        let mut current = Values {
+            size: positions
+                .iter()
+                .map(|p| number(&p.size))
+                .sum::<Option<f64>>()?,
+            notional: positions
+                .iter()
+                .map(|p| {
+                    number(&p.notional_value)
+                        .zip(number(&p.size))
+                        .map(|(n, s)| n.abs() * s.signum())
+                })
+                .sum(),
+            pnl: positions.iter().map(|p| number(&p.unrealized_pnl)).sum(),
+            entry: if positions.len() == 1 {
+                number(&positions[0].entry_price)
             } else {
-                // A complete, valid snapshot without this position confirms it is flat.
-                Values {
-                    size: 0.0,
-                    notional: Some(0.0),
-                    pnl: Some(0.0),
-                    entry: None,
-                }
-            };
+                None
+            },
+        };
         if let Some(live) = state.live_positions.iter().find(|p| {
             p.coin == market.symbol && p.time_ms > state.position_snapshot_time(&market.symbol)
         }) {
@@ -201,11 +208,17 @@ fn values(
     if state.spot_updated_at_ms <= 0 {
         return None;
     }
-    let token = info?.base_token_id?;
+    let info = info?;
     let size = state
         .spot_balances
         .iter()
-        .find(|balance| balance.token == token)
+        .find(|balance| {
+            if market.exchange == Exchange::Hyperliquid {
+                info.base_token_id == Some(balance.token)
+            } else {
+                balance.coin == info.base
+            }
+        })
         .map_or(Some(0.0), |balance| number(&balance.total))?;
     let mid = data
         .filter(|data| data.connected)
@@ -285,7 +298,24 @@ pub fn config_ui(
     errors: &HashMap<(Exchange, MarketKind), String>,
     retry: &mut HashSet<(Exchange, MarketKind)>,
 ) {
-    ui.weak("Hyperliquid");
+    egui::ComboBox::from_id_salt("position-exchange")
+        .selected_text(market.exchange.label())
+        .show_ui(ui, |ui| {
+            for exchange in [
+                Exchange::Hyperliquid,
+                Exchange::Binance,
+                Exchange::Bybit,
+                Exchange::Okx,
+            ] {
+                if ui
+                    .selectable_label(market.exchange == exchange, exchange.label())
+                    .clicked()
+                {
+                    *market = Market::for_exchange_kind(exchange, market.kind);
+                    search.clear();
+                }
+            }
+        });
     ui.horizontal(|ui| {
         for kind in MarketKind::ALL {
             if ui
@@ -293,7 +323,7 @@ pub fn config_ui(
                 .clicked()
                 && market.kind != kind
             {
-                *market = Market::for_exchange_kind(Exchange::Hyperliquid, kind);
+                *market = Market::for_exchange_kind(market.exchange, kind);
                 search.clear();
                 if kind == MarketKind::Spot && settings.metric == Metric::Pnl {
                     settings.metric = Metric::Size;
@@ -910,6 +940,7 @@ mod tests {
             connected: true,
             positions_updated_at_ms: 1_000,
             positions: vec![terminal_core::Position {
+                leg: String::new(),
                 coin: "BTC".into(),
                 size: size.into(),
                 entry_price: "100".into(),
@@ -1048,8 +1079,46 @@ mod tests {
     }
 
     #[test]
+    fn api_positions_keep_hedge_legs_and_spot_assets_separate() {
+        let market = Market::for_exchange_kind(Exchange::Bybit, MarketKind::Perp);
+        let mut state = state("2");
+        state.positions[0].coin = market.symbol.clone();
+        state.positions[0].leg = "1".into();
+        let mut short = state.positions[0].clone();
+        short.size = "-1".into();
+        short.leg = "2".into();
+        short.unrealized_pnl = "3".into();
+        state.positions.push(short);
+        let current = values(&market, &state, None, None).unwrap();
+        assert_eq!(current.size, 1.0);
+        assert!(current.entry.is_none());
+        let pane = crate::Pane::new(crate::WidgetKind::Position, market.clone());
+        assert_eq!(pane.market, market);
+        let spot = Market::for_exchange_kind(Exchange::Bybit, MarketKind::Spot);
+        let info = SymbolInfo {
+            symbol: spot.symbol.clone(),
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            base_token_id: None,
+            market_id: None,
+            size_multiplier: None,
+            price_step: None,
+        };
+        state.spot_updated_at_ms = 100;
+        state.spot_balances = vec![terminal_core::SpotBalance {
+            coin: "BTC".into(),
+            token: 0,
+            total: "4".into(),
+            hold: "1".into(),
+        }];
+        assert_eq!(values(&spot, &state, Some(&info), None).unwrap().size, 4.0);
+    }
+    #[test]
     fn widget_settings_survive_save_and_market_change_clears_history() {
-        let mut pane = crate::Pane::new(crate::WidgetKind::Position, Market::default());
+        let mut pane = crate::Pane::new(
+            crate::WidgetKind::Position,
+            Market::for_exchange(Exchange::Hyperliquid),
+        );
         pane.position.metric = Metric::Notional;
         pane.position.sum = true;
         pane.position.window_secs = 120;

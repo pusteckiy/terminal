@@ -43,6 +43,8 @@ fn parse_orders(data: &Value) -> Option<Vec<OwnOrder>> {
                     _ => return None,
                 };
                 Some(OwnOrder {
+                    kind: None,
+                    external_id: None,
                     coin: field(row, "coin")?,
                     order_id: row.get("oid")?.as_u64()?,
                     side,
@@ -66,6 +68,7 @@ fn parse_positions(data: &Value) -> Option<Vec<Position>> {
             continue;
         }
         positions.push(Position {
+            leg: String::new(),
             coin,
             size,
             entry_price: field(position, "entryPx").unwrap_or_default(),
@@ -207,6 +210,8 @@ fn parse_fills(data: &Value) -> Option<Vec<OwnFill>> {
                     return None;
                 }
                 Some(OwnFill {
+                    order_external_id: None,
+                    execution_id: None,
                     market: Market {
                         exchange: Exchange::Hyperliquid,
                         kind,
@@ -417,6 +422,8 @@ mod tests {
 
     fn fill(start: &str, size: &str, side: TradeSide, time_ms: i64) -> OwnFill {
         OwnFill {
+            order_external_id: None,
+            execution_id: None,
             market: Market::for_exchange(Exchange::Hyperliquid),
             time_ms,
             trade_id: 1,

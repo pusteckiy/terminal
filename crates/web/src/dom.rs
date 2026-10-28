@@ -1177,7 +1177,13 @@ pub fn ui(
                 let suffix = &account.address[account.address.len().saturating_sub(4)..];
                 ui.weak(format!(
                     "#{} · {} × {} · …{}",
-                    order.order_id, order.price, order.size, suffix
+                    order
+                        .external_id
+                        .clone()
+                        .unwrap_or_else(|| order.order_id.to_string()),
+                    order.price,
+                    order.size,
+                    suffix
                 ));
             }
             if data
@@ -1391,6 +1397,8 @@ mod tests {
             address: "0x1234".into(),
         };
         let order = OwnOrder {
+            kind: None,
+            external_id: None,
             coin: "BTC".into(),
             order_id: 1,
             side: TradeSide::Buy,
@@ -1443,6 +1451,8 @@ mod tests {
             address: "0x1234".into(),
         };
         let order = OwnOrder {
+            kind: None,
+            external_id: None,
             coin: "BTC".into(),
             order_id: 1,
             side: TradeSide::Buy,
@@ -1546,6 +1556,8 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, (price, side))| OwnOrder {
+            kind: None,
+            external_id: None,
             coin: "BTC".into(),
             order_id: index as u64,
             side,

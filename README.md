@@ -45,6 +45,18 @@ Use the up/down controls beside sources in widget config to change their order. 
 
 Market updates continue through background logic when the browser hides the tab. If suspension or overload leaves the client too far behind, it reconnects and restores current snapshots on return; hidden overload waits until the tab is visible to avoid reconnect churn. Public trades missed during a resync are not backfilled.
 
+## API accounts
+
+In the web terminal, open **Accounts → Connect account**, create an API-keys password (at least 12 characters), then add a system-generated HMAC key for Binance, Bybit or OKX. Choose Spot, linear Perps, or both. Only read-only keys are accepted; trading, transfers and withdrawals must be disabled. OKX also requires its API passphrase. Orders, positions, balances and fills feed the existing widgets; POSITION shows net size when an account holds both hedge legs.
+
+Open the gear in the compact account menu for storage settings, lock, and encrypted backups. Account details and live state open separately; the eye controls visibility on widgets. Removing a connection requires confirmation.
+
+Keys are encrypted in this browser's IndexedDB using AES-256-GCM and PBKDF2-SHA256 (600,000 iterations). Unlock once per page session. **Lock** stops private connections and clears private widget data; reloading the page requires the password again. The password is not recoverable. **Export encrypted backup** / **Import encrypted backup** transfers the encrypted JSON between browsers or devices; clearing browser storage removes the local copy. There is no cloud sync or system keystore.
+
+Signing happens in Rust/WASM. The stateless relay forwards allowlisted read requests and private WebSocket traffic, using the server's IP for exchange whitelists. API secrets and the encryption password never go to the server. The relay does see API keys, signatures, OKX API passphrases, temporary stream tokens and private exchange responses while forwarding them; it does not persist or broadcast these between clients. Serve over **HTTPS/WSS** outside localhost and preserve the original `Host` header behind a reverse proxy. Trust the server and browser extensions: encryption at rest does not protect an unlocked browser from malicious code.
+
+Supported accounts: Binance.com Spot / USDⓈ-M, Bybit Unified Spot / USDT and USDC linear derivatives, OKX Global Spot / linear swaps. Inverse contracts, options, margin borrowing operations and trigger-only orders are not displayed as resting orders. Binance initially loads up to 100 recent fills for each of up to 32 visible/open-order symbols; Bybit and OKX load up to 500 recent fills per selected market type. Live fills stream for the selected market types; reconnect backfill has these same history limits. Native desktop API-key connections and regional exchange domains are not included.
+
 ## Run locally
 
 Requires Rust and [Trunk](https://github.com/trunk-rs/trunk).

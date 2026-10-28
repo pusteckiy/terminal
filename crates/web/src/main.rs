@@ -1,3 +1,4 @@
+mod accounts;
 mod audio;
 mod batch;
 mod candles;
@@ -5,7 +6,9 @@ mod dom;
 mod fills;
 mod orderflow;
 mod position;
+mod private;
 mod socket;
+mod vault;
 mod view;
 
 use std::{
@@ -232,12 +235,6 @@ struct Pane {
 
 impl Pane {
     fn new(kind: WidgetKind, market: Market) -> Self {
-        let market =
-            if matches!(kind, WidgetKind::Position) && market.exchange != Exchange::Hyperliquid {
-                Market::for_exchange(Exchange::Hyperliquid)
-            } else {
-                market
-            };
         let series = if matches!(kind, WidgetKind::Compare | WidgetKind::Tape) {
             vec![
                 Market::for_exchange(Exchange::Binance),
@@ -643,6 +640,7 @@ fn apply_book_side(levels: &mut Vec<Level>, changes: Vec<BookChange>, bids: bool
 
 struct TerminalApp {
     audio: audio::TradeAudio,
+    private: private::Controller,
     workspaces: Vec<Tree<Pane>>,
     active_workspace: usize,
     tab_hover: Option<(usize, f64)>,
@@ -658,7 +656,7 @@ struct TerminalApp {
     account_data: HashMap<Account, AccountState>,
     fills: fills::Store,
     subscribed_accounts: HashSet<Account>,
-    account_exchange: Exchange,
+    account_ui: accounts::Menu,
     account_address: String,
     account_error: Option<String>,
     focused: Option<TileId>,
@@ -719,6 +717,7 @@ impl TerminalApp {
                     .and_then(|saved| serde_json::from_str(&saved).ok())
                     .unwrap_or_default(),
             ),
+            private: private::Controller::default(),
             workspaces,
             active_workspace,
             tab_hover: None,
@@ -735,7 +734,7 @@ impl TerminalApp {
                 .and_then(|saved| serde_json::from_str::<Vec<Account>>(&saved).ok())
                 .unwrap_or_default()
                 .into_iter()
-                .filter(Account::valid)
+                .filter(|a| a.valid() || private::is_private(a))
                 .collect(),
             hidden_widget_accounts: cc
                 .storage
@@ -745,7 +744,7 @@ impl TerminalApp {
             account_data: HashMap::new(),
             fills: fills::Store::default(),
             subscribed_accounts: HashSet::new(),
-            account_exchange: Exchange::Hyperliquid,
+            account_ui: accounts::Menu::default(),
             account_address: String::new(),
             account_error: None,
             focused: None,
@@ -755,6 +754,8 @@ impl TerminalApp {
             reconnect_at: 0,
             resync_on_visible: false,
         };
+        #[cfg(target_arch = "wasm32")]
+        app.private.vault.load(&cc.egui_ctx);
         app.connect(&cc.egui_ctx);
         app
     }
@@ -865,7 +866,12 @@ impl TerminalApp {
             self.send(ClientMessage::Subscribe { market });
         }
         self.subscribed = wanted;
-        let wanted_accounts: HashSet<_> = self.accounts.iter().cloned().collect();
+        let wanted_accounts: HashSet<_> = self
+            .accounts
+            .iter()
+            .filter(|a| !private::is_private(a))
+            .cloned()
+            .collect();
         for account in self
             .subscribed_accounts
             .difference(&wanted_accounts)
@@ -1115,7 +1121,8 @@ impl TerminalApp {
         self.socket_open = false;
         self.subscribed.clear();
         self.subscribed_accounts.clear();
-        self.account_data.clear();
+        self.account_data
+            .retain(|account, _| private::is_private(account));
         for data in self.data.values_mut() {
             data.connected = false;
             data.book = None;
@@ -1383,208 +1390,6 @@ impl TerminalApp {
             self.batch_change = Some(batch::Dialog::new(index));
         }
         add
-    }
-
-    fn account_menu(&mut self, ui: &mut egui::Ui) {
-        let button = egui::Button::new("")
-            .fill(RAISED)
-            .stroke(egui::Stroke::new(1.0, BORDER))
-            .corner_radius(egui::CornerRadius::same(6))
-            .min_size(egui::vec2(29.0, 25.0));
-        let (response, _) = egui::menu::MenuButton::from_button(button)
-            .config(
-                egui::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-            )
-            .ui(ui, |ui| {
-                ui.set_min_width(290.0);
-                ui.label(
-                    RichText::new("ACCOUNTS")
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                ui.label(
-                    RichText::new("Read-only live orders and positions")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                ui.separator();
-                let mut remove = None;
-                if self.accounts.is_empty() {
-                    ui.label(RichText::new("No accounts connected").color(MUTED));
-                }
-                for (index, account) in self.accounts.iter().enumerate() {
-                    let state = self.account_data.get(account);
-                    ui.horizontal(|ui| {
-                        let status = state.is_some_and(|state| state.connected);
-                        let (dot, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
-                        ui.painter().circle_filled(
-                            dot.center(),
-                            3.0,
-                            if status { GREEN } else { MUTED },
-                        );
-                        ui.label(format!(
-                            "{}  {}…{}",
-                            account.exchange.label(),
-                            &account.address[..6],
-                            &account.address[account.address.len() - 4..]
-                        ))
-                        .on_hover_text(&account.address);
-                        let visible = !self.hidden_widget_accounts.contains(account);
-                        if account_visibility_button(ui, visible) {
-                            if visible {
-                                self.hidden_widget_accounts.insert(account.clone());
-                            } else {
-                                self.hidden_widget_accounts.remove(account);
-                            }
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Remove account")
-                            .clicked()
-                        {
-                            remove = Some(index);
-                        }
-                    });
-                    if let Some(state) = state {
-                        let description =
-                            state
-                                .error
-                                .as_deref()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| {
-                                    if state.connected {
-                                        format!(
-                                            "{} orders · {} positions · live",
-                                            state.orders.len(),
-                                            state.positions.len()
-                                        )
-                                    } else {
-                                        "Syncing current state…".to_owned()
-                                    }
-                                });
-                        ui.label(RichText::new(description).size(10.0).color(MUTED));
-                        if state.connected
-                            && (!state.orders.is_empty() || !state.positions.is_empty())
-                        {
-                            ui.collapsing("View live state", |ui| {
-                                egui::ScrollArea::vertical()
-                                    .max_height(180.0)
-                                    .show(ui, |ui| {
-                                        for position in &state.positions {
-                                            let long = !position.size.starts_with('-');
-                                            ui.colored_label(
-                                                if long { GREEN } else { RED },
-                                                format!(
-                                                    "{} {} {} @ {} · PnL {}",
-                                                    position.coin,
-                                                    if long { "LONG" } else { "SHORT" },
-                                                    position.size,
-                                                    position.entry_price,
-                                                    position.unrealized_pnl
-                                                ),
-                                            );
-                                        }
-                                        for order in &state.orders {
-                                            ui.colored_label(
-                                                if order.side == TradeSide::Buy {
-                                                    GREEN
-                                                } else {
-                                                    RED
-                                                },
-                                                format!(
-                                                    "{} {} {} @ {}",
-                                                    order.coin,
-                                                    if order.side == TradeSide::Buy {
-                                                        "BUY"
-                                                    } else {
-                                                        "SELL"
-                                                    },
-                                                    order.size,
-                                                    order.price
-                                                ),
-                                            );
-                                        }
-                                    });
-                            });
-                        }
-                    }
-                }
-                if let Some(index) = remove {
-                    let account = self.accounts.remove(index);
-                    self.hidden_widget_accounts.remove(&account);
-                }
-                ui.separator();
-                ui.label(
-                    RichText::new("CONNECT ACCOUNT")
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                ui.label(
-                    RichText::new("Use the trading or sub-account address")
-                        .size(10.0)
-                        .color(MUTED),
-                );
-                egui::ComboBox::from_id_salt("account-exchange")
-                    .selected_text(self.account_exchange.label())
-                    .show_ui(ui, |ui| {
-                        for exchange in Exchange::ALL {
-                            ui.add_enabled_ui(exchange == Exchange::Hyperliquid, |ui| {
-                                ui.selectable_value(
-                                    &mut self.account_exchange,
-                                    exchange,
-                                    exchange.label(),
-                                );
-                            });
-                        }
-                    });
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.account_address)
-                        .hint_text("0x wallet address")
-                        .desired_width(270.0),
-                );
-                if let Some(error) = &self.account_error {
-                    ui.label(RichText::new(error).size(11.0).color(RED));
-                }
-                if ui.button("Connect account").clicked() {
-                    let account = Account {
-                        exchange: self.account_exchange,
-                        address: self.account_address.trim().to_ascii_lowercase(),
-                    };
-                    if !account.valid() {
-                        self.account_error = Some("Enter a valid 0x wallet address".into());
-                    } else if self.accounts.contains(&account) {
-                        self.account_error = Some("This account is already connected".into());
-                    } else {
-                        self.hidden_widget_accounts.remove(&account);
-                        self.accounts.push(account);
-                        self.account_address.clear();
-                        self.account_error = None;
-                    }
-                }
-            });
-        let painter = ui.painter();
-        let center = response.rect.center();
-        painter.circle_stroke(
-            center + egui::vec2(0.0, -3.0),
-            2.6,
-            egui::Stroke::new(1.35, TEXT),
-        );
-        painter.add(egui::epaint::PathShape::line(
-            vec![
-                center + egui::vec2(-5.3, 5.0),
-                center + egui::vec2(-4.0, 2.0),
-                center + egui::vec2(-1.7, 0.9),
-                center + egui::vec2(1.7, 0.9),
-                center + egui::vec2(4.0, 2.0),
-                center + egui::vec2(5.3, 5.0),
-            ],
-            egui::Stroke::new(1.35, TEXT),
-        ));
-        response.on_hover_text("Accounts");
     }
 
     fn switch_workspace(&mut self, index: usize) {
@@ -2005,7 +1810,7 @@ fn visible_source_orders<'a>(
     for (index, market) in sources.iter().enumerate() {
         for (account, state) in visible_account_states(market, states, hidden) {
             for order in &state.orders {
-                if order.coin == market.symbol {
+                if order.matches_market(market) {
                     orders.push((index, account, order));
                 }
             }
@@ -2091,13 +1896,26 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                             pane.batch_symbol.as_deref().unwrap_or(&pane.market.symbol)
                         )
                     } else if matches!(pane.kind, WidgetKind::Fills) {
-                        "Hyperliquid".to_owned()
+                        "Connected accounts".to_owned()
                     } else if matches!(pane.kind, WidgetKind::Position)
                         && pane.market.kind == MarketKind::Spot
                     {
                         orderflow::symbol_info(&pane.market, self.catalogs).map_or_else(
-                            || format!("Hyperliquid Spot {}", pane.market.symbol),
-                            |info| format!("Hyperliquid Spot {}/{}", info.base, info.quote),
+                            || {
+                                format!(
+                                    "{} Spot {}",
+                                    pane.market.exchange.label(),
+                                    pane.market.symbol
+                                )
+                            },
+                            |info| {
+                                format!(
+                                    "{} Spot {}/{}",
+                                    pane.market.exchange.label(),
+                                    info.base,
+                                    info.quote
+                                )
+                            },
                         )
                     } else if pane.uses_sources()
                         && (!matches!(pane.kind, WidgetKind::Dom) || pane.series.len() > 1)
@@ -2285,7 +2103,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             visible_account_states(market, self.account_data, self.hidden_widget_accounts)
                 .flat_map(|(account, state)| {
                     state.orders.iter().filter_map(move |order| {
-                        (order.coin == market.symbol).then_some((account, order))
+                        order.matches_market(market).then_some((account, order))
                     })
                 })
                 .collect();
@@ -2381,8 +2199,10 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             }
 
             WidgetKind::Fills => {
-                for kind in MarketKind::ALL {
-                    self.needed_catalogs.insert((Exchange::Hyperliquid, kind));
+                for account in self.accounts {
+                    for kind in MarketKind::ALL {
+                        self.needed_catalogs.insert((account.exchange, kind));
+                    }
                 }
                 fills::ui(
                     ui,
@@ -2469,6 +2289,25 @@ impl Behavior<Pane> for PaneBehavior<'_> {
 impl eframe::App for TerminalApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_socket(ctx);
+        let markets = self
+            .workspaces
+            .iter()
+            .flat_map(|tree| tree.tiles.iter())
+            .filter_map(|(_, tile)| match tile {
+                Tile::Pane(pane) => Some(pane),
+                _ => None,
+            })
+            .flat_map(|pane| std::iter::once(pane.market.clone()).chain(pane.series.clone()))
+            .collect();
+        if self.private.poll(
+            ctx,
+            &mut self.accounts,
+            &mut self.account_data,
+            &mut self.fills,
+            markets,
+        ) {
+            self.record_positions(None);
+        }
         let visible = ctx.input(|input| input.viewport().visible() != Some(false));
         if self.resync_on_visible && !visible {
             self.audio.clear_pending();
@@ -2607,6 +2446,212 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_accounts_keep_details_scrolling_and_removal_isolated() {
+        fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+            fn collect(
+                shape: &egui::Shape,
+                clip: egui::Rect,
+                texts: &mut Vec<(String, egui::Rect)>,
+            ) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        if clip.intersects(rect) {
+                            texts.push((text.galley.text().to_owned(), rect));
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, clip, texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                collect(&shape.shape, shape.clip_rect, &mut texts);
+            }
+            texts
+        }
+        fn draw(
+            ctx: &egui::Context,
+            app: &mut TerminalApp,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Popup::open_id(ui.ctx(), ui.next_auto_id().with("popup"));
+                    app.account_menu(ui);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        fn click(ctx: &egui::Context, app: &mut TerminalApp, pos: egui::Pos2) {
+            for pressed in [true, false] {
+                draw(
+                    ctx,
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+        }
+        fn label(ctx: &egui::Context, app: &mut TerminalApp, name: &str) -> egui::Pos2 {
+            texts(&draw(ctx, app, Vec::new()))
+                .into_iter()
+                .find(|(text, _)| text == name)
+                .unwrap_or_else(|| panic!("Missing {name}"))
+                .1
+                .center()
+        }
+        let mut app = test_app();
+        for (index, address) in [
+            "0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00",
+            "0x223537ac9a856c31f4043e86ced86bb29f06653e",
+            "0xd0956a1eba0a9060baf5f73ee26b9601dc47ec43",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let account = Account {
+                exchange: Exchange::Hyperliquid,
+                address: address.into(),
+            };
+            app.account_data.insert(
+                account.clone(),
+                AccountState {
+                    connected: true,
+                    orders: (0..50)
+                        .map(|row| OwnOrder {
+                            kind: None,
+                            external_id: None,
+                            coin: format!("ACCOUNT{index}-ROW{row}"),
+                            order_id: row,
+                            side: TradeSide::Buy,
+                            price: "100".into(),
+                            size: "1".into(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+            app.accounts.push(account);
+        }
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        draw(&ctx, &mut app, Vec::new());
+        let initial = texts(&draw(&ctx, &mut app, Vec::new()));
+        assert!(!initial.iter().any(|(t, _)| t == "View live state"
+            || t == "Remove account"
+            || t.contains("password")));
+        let arrows: Vec<_> = initial.iter().filter(|(t, _)| t == "›").collect();
+        assert_eq!(arrows.len(), 3);
+        click(&ctx, &mut app, arrows[2].1.center());
+        let pos = label(&ctx, &mut app, "View live state");
+        click(&ctx, &mut app, pos);
+        let visible = texts(&draw(&ctx, &mut app, Vec::new()));
+        assert!(visible.iter().any(|(t, _)| t.starts_with("ACCOUNT2-ROW0 ")));
+        assert!(
+            !visible
+                .iter()
+                .any(|(t, _)| t.starts_with("ACCOUNT0-") || t.starts_with("ACCOUNT1-"))
+        );
+        let pos = visible
+            .iter()
+            .find(|(t, _)| t.starts_with("ACCOUNT2-ROW0 "))
+            .unwrap()
+            .1
+            .center();
+        draw(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        for _ in 0..20 {
+            draw(&ctx, &mut app, Vec::new());
+        }
+        assert!(
+            !texts(&draw(&ctx, &mut app, Vec::new()))
+                .iter()
+                .any(|(t, _)| t.starts_with("ACCOUNT2-ROW0 "))
+        );
+        let pos = label(&ctx, &mut app, "‹ Accounts");
+        click(&ctx, &mut app, pos);
+        let initial = texts(&draw(&ctx, &mut app, Vec::new()));
+        let first = initial.iter().find(|(t, _)| t == "›").unwrap().1.center();
+        click(&ctx, &mut app, first);
+        let pos = label(&ctx, &mut app, "View live state");
+        click(&ctx, &mut app, pos);
+        assert!(
+            texts(&draw(&ctx, &mut app, Vec::new()))
+                .iter()
+                .any(|(t, _)| t.starts_with("ACCOUNT0-ROW0 "))
+        );
+        let pos = label(&ctx, &mut app, "View live state");
+        click(&ctx, &mut app, pos);
+        let pos = label(&ctx, &mut app, "Remove account");
+        click(&ctx, &mut app, pos);
+        assert_eq!(
+            app.accounts.len(),
+            3,
+            "first click only asks for confirmation"
+        );
+        let pos = label(&ctx, &mut app, "Cancel");
+        click(&ctx, &mut app, pos);
+        assert_eq!(app.accounts.len(), 3);
+        let removed = app.accounts[0].clone();
+        let pos = label(&ctx, &mut app, "Remove account");
+        click(&ctx, &mut app, pos);
+        let pos = label(&ctx, &mut app, "Remove account");
+        click(&ctx, &mut app, pos);
+        assert_eq!(app.accounts.len(), 2);
+        assert!(!app.account_data.contains_key(&removed));
+        let pos = label(&ctx, &mut app, "+ Connect account");
+        click(&ctx, &mut app, pos);
+        let choices = texts(&draw(&ctx, &mut app, Vec::new()));
+        for venue in ["Hyperliquid", "Binance", "Bybit", "OKX"] {
+            assert!(choices.iter().any(|(t, _)| t == venue));
+        }
+        assert!(
+            !choices
+                .iter()
+                .any(|(t, _)| t.contains("password") || t == "0x…")
+        );
+        let pos = label(&ctx, &mut app, "Hyperliquid");
+        click(&ctx, &mut app, pos);
+        app.account_address = "invalid".into();
+        let pos = label(&ctx, &mut app, "Connect account");
+        click(&ctx, &mut app, pos);
+        assert!(app.account_error.is_some());
+        assert_eq!(app.accounts.len(), 2);
+    }
 
     #[test]
     fn deferred_socket_backlog_yields_before_blocking_a_frame() {
@@ -2865,6 +2910,7 @@ mod tests {
     pub(super) fn test_app() -> TerminalApp {
         TerminalApp {
             audio: audio::TradeAudio::new(audio::Settings::default()),
+            private: private::Controller::default(),
             workspaces: (0..3).map(TerminalApp::default_tree).collect(),
             active_workspace: 0,
             tab_hover: None,
@@ -2880,7 +2926,7 @@ mod tests {
             account_data: HashMap::new(),
             fills: fills::Store::default(),
             subscribed_accounts: HashSet::new(),
-            account_exchange: Exchange::Hyperliquid,
+            account_ui: accounts::Menu::default(),
             account_address: String::new(),
             account_error: None,
             focused: None,
@@ -2959,6 +3005,8 @@ mod tests {
             AccountState {
                 connected: true,
                 orders: vec![OwnOrder {
+                    kind: None,
+                    external_id: None,
                     coin: hyper.symbol.clone(),
                     order_id: 7,
                     side: TradeSide::Buy,

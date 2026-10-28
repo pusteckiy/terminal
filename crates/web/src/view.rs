@@ -2568,6 +2568,8 @@ mod tests {
             address: "0x1234".into(),
         };
         let order = OwnOrder {
+            kind: None,
+            external_id: None,
             coin: "kPEPE".into(),
             order_id: 1,
             side: TradeSide::Buy,
@@ -2717,6 +2719,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000000".into(),
         };
         let order = OwnOrder {
+            kind: None,
+            external_id: None,
             coin: "BTC".into(),
             order_id: 1,
             side: TradeSide::Buy,

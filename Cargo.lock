@@ -2941,15 +2941,21 @@ dependencies = [
 name = "terminal-web"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "eframe",
  "egui_tiles",
  "ewebsock",
+ "futures-channel",
+ "futures-util",
+ "js-sys",
  "rust_decimal",
  "serde",
  "serde_json",
  "terminal-core",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "zeroize",
 ]
 
 [[package]]
