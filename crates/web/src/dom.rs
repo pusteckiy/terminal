@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use terminal_core::{Account, Book, OwnOrder, SymbolInfo, Trade, TradeSide};
+use terminal_core::{Account, Book, Market, OwnFill, OwnOrder, SymbolInfo, Trade, TradeSide};
 
 mod multi;
 pub use multi::ui as multi_ui;
@@ -54,6 +54,7 @@ pub struct Settings {
     units: Units,
     compact: bool,
     trade_stream: bool,
+    show_fills: bool,
     total_liquidity: bool,
 }
 
@@ -65,12 +66,17 @@ impl Default for Settings {
             units: Units::Base,
             compact: false,
             trade_stream: false,
+            show_fills: true,
             total_liquidity: false,
         }
     }
 }
 
 impl Settings {
+    pub fn shows_fills(&self) -> bool {
+        self.trade_stream && self.show_fills
+    }
+
     pub fn enable_multi(&mut self) {
         self.compact = true;
         self.trade_stream = true;
@@ -81,6 +87,7 @@ pub fn config_ui(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(&mut settings.compact, "Compact DOM");
     ui.checkbox(&mut settings.trade_stream, "Show trade flow")
         .on_hover_text("Show live trades to the left, aligned to the DOM price rows. Both sides scroll together and use the same price grouping and trade window.");
+    ui.checkbox(&mut settings.show_fills, "Show my fills");
     ui.checkbox(&mut settings.total_liquidity, "Total liquidity")
         .on_hover_text("Sum visible venues with the same asset, market type and quote currency. Unavailable or uncovered depth is shown as —.");
     ui.separator();
@@ -563,6 +570,9 @@ pub fn ui(
     settings: &Settings,
     view: &mut View,
     orders: &[(&Account, &OwnOrder)],
+    own_fills: &[(usize, &Account, &OwnFill)],
+    catalogs: &HashMap<(terminal_core::Exchange, terminal_core::MarketKind), Vec<SymbolInfo>>,
+    market: &Market,
 ) {
     let Some(data) = data else {
         ui.centered_and_justified(|ui| {
@@ -724,7 +734,18 @@ pub fn ui(
     }
     let count = (body.height() / ROW_HEIGHT).ceil() as i64;
     if !view.following {
-        let (low, high) = anchor_bounds(book, &data.dom, orders, utc_ms, window, step, reference);
+        let (mut low, mut high) =
+            anchor_bounds(book, &data.dom, orders, utc_ms, window, step, reference);
+        if settings.trade_stream && settings.show_fills {
+            for (_, _, fill) in own_fills {
+                if (0..i64::from(window) * 1000).contains(&(utc_ms - fill.time_ms))
+                    && let Some(price) = positive(&fill.price)
+                {
+                    low = low.min(group(price, step));
+                    high = high.max(group(price, step));
+                }
+            }
+        }
         view.anchor = view.anchor.map(|price| price.clamp(low, high));
     }
     let anchor = view.anchor.unwrap_or(reference);
@@ -1118,6 +1139,46 @@ pub fn ui(
             );
         }
     }
+    let mut hovered_fill = false;
+    if settings.trade_stream && settings.show_fills {
+        let start_ms = (utc_ms.div_euclid(1_000) - i64::from(window) + 1) * 1_000;
+        hovered_fill =
+            crate::fills::overlay(ui, &response, plot, own_fills, catalogs, |_, fill| {
+                if !(start_ms..=utc_ms).contains(&fill.time_ms) {
+                    return None;
+                }
+                let price = positive(&fill.price)?;
+                Some((
+                    Pos2::new(
+                        plot.left()
+                            + (fill.time_ms - start_ms) as f32 / (utc_ms - start_ms).max(1) as f32
+                                * plot.width(),
+                        level_y(price, top_price, step, plot),
+                    ),
+                    1,
+                ))
+            });
+    }
+
+    if settings.trade_stream && !hovered_fill {
+        order_hover(
+            ui,
+            &response,
+            plot,
+            orders.iter().filter_map(|(account, order)| {
+                let price = positive(&order.price)?;
+                positive(&order.size)?;
+                Some((
+                    market,
+                    *account,
+                    *order,
+                    1,
+                    level_y(price, top_price, step, plot),
+                ))
+            }),
+        );
+    }
+
     if let Some(index) = hovered.filter(|_| {
         response
             .hover_pos()
@@ -1203,10 +1264,208 @@ pub fn ui(
         .request_repaint_after(std::time::Duration::from_millis(100));
 }
 
+// A grouped row can contain several orders; keep each venue/account in its tooltip.
+fn order_hover<'a>(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    plot: Rect,
+    orders: impl Iterator<Item = (&'a Market, &'a Account, &'a OwnOrder, u64, f32)>,
+) {
+    if response.dragged() {
+        return;
+    }
+    let Some(pointer) = response.hover_pos().filter(|p| plot.contains(*p)) else {
+        return;
+    };
+    let orders: Vec<_> = orders
+        .filter(|(_, _, order, _, y)| {
+            order.side != TradeSide::Unknown
+                && y.is_finite()
+                && *y >= plot.top()
+                && *y <= plot.bottom()
+        })
+        .collect();
+    let Some(y) = orders
+        .iter()
+        .map(|o| o.4)
+        .filter(|y| (pointer.y - y).abs() <= 5.0)
+        .min_by(|a, b| (pointer.y - a).abs().total_cmp(&(pointer.y - b).abs()))
+    else {
+        return;
+    };
+    let both = orders
+        .iter()
+        .any(|o| o.4 == y && o.2.side == TradeSide::Buy)
+        && orders
+            .iter()
+            .any(|o| o.4 == y && o.2.side == TradeSide::Sell);
+    let selected = |order: &OwnOrder| {
+        !both
+            || if pointer.x < plot.center().x {
+                order.side == TradeSide::Buy
+            } else {
+                order.side == TradeSide::Sell
+            }
+    };
+    let left = if both && pointer.x >= plot.center().x {
+        plot.center().x
+    } else {
+        plot.left()
+    };
+    let right = if both && pointer.x < plot.center().x {
+        plot.center().x
+    } else {
+        plot.right()
+    };
+    egui::Tooltip::for_widget(response)
+        .at_pointer()
+        .gap(12.0)
+        .show(|ui| {
+            for (market, account, order, multiplier, _) in
+                orders.iter().filter(|o| o.4 == y && selected(o.2))
+            {
+                let color = trade_color(order.side, MUTED);
+                ui.colored_label(
+                    color,
+                    crate::view::order_details(market, account, order, *multiplier).0,
+                );
+                ui.weak(format!(
+                    "#{}",
+                    order
+                        .external_id
+                        .clone()
+                        .unwrap_or_else(|| order.order_id.to_string())
+                ));
+            }
+        });
+    if let Some(order) = orders.iter().find(|o| o.4 == y && selected(o.2)) {
+        ui.painter_at(plot).line_segment(
+            [Pos2::new(left, y), Pos2::new(right, y)],
+            Stroke::new(1.4, trade_color(order.2.side, MUTED)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use terminal_core::Level;
+
+    #[test]
+    fn order_line_hover_keeps_grouped_venues_accounts_and_sides_distinct() {
+        use terminal_core::{Exchange, MarketKind};
+        let market = Market {
+            exchange: Exchange::Binance,
+            kind: MarketKind::Perp,
+            symbol: "1000PEPEUSDT".into(),
+        };
+        let other = Market {
+            exchange: Exchange::Hyperliquid,
+            kind: MarketKind::Perp,
+            symbol: "kPEPE".into(),
+        };
+        let account = Account {
+            exchange: market.exchange,
+            address: "api:1234".into(),
+        };
+        let other_account = Account {
+            exchange: other.exchange,
+            address: "0x5678".into(),
+        };
+        let buy = OwnOrder {
+            kind: None,
+            external_id: Some("buy-id".into()),
+            coin: market.symbol.clone(),
+            order_id: 1,
+            side: TradeSide::Buy,
+            price: "0.004308".into(),
+            size: "2".into(),
+        };
+        let second_buy = OwnOrder {
+            external_id: Some("second-buy".into()),
+            ..buy.clone()
+        };
+        let sell = OwnOrder {
+            external_id: Some("sell-id".into()),
+            side: TradeSide::Sell,
+            ..buy.clone()
+        };
+        for (left, expected, absent) in [(true, "BUY", "SELL"), (false, "SELL", "BUY")] {
+            let ctx = egui::Context::default();
+            ctx.global_style_mut(|style| {
+                style.interaction.tooltip_delay = 0.0;
+                style.interaction.show_tooltips_only_when_still = false;
+            });
+            let mut pointer = Pos2::ZERO;
+            let mut labels = Vec::new();
+            for frame in 0..4 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 500.0))),
+                        time: Some(frame as f64),
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let (plot, response) =
+                            ui.allocate_exact_size(Vec2::new(300.0, 220.0), Sense::hover());
+                        pointer = Pos2::new(
+                            if left {
+                                plot.left() + 20.0
+                            } else {
+                                plot.right() - 20.0
+                            },
+                            plot.center().y,
+                        );
+                        order_hover(
+                            ui,
+                            &response,
+                            plot,
+                            [
+                                (&market, &account, &buy, 1000, plot.center().y),
+                                (&other, &other_account, &second_buy, 1000, plot.center().y),
+                                (&market, &account, &sell, 1000, plot.center().y),
+                            ]
+                            .into_iter(),
+                        );
+                    },
+                );
+                labels.extend(output.shapes.iter().filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                }));
+                output.textures_delta.clear();
+            }
+            assert!(
+                labels
+                    .iter()
+                    .any(|s| s.contains(&format!("ORDER {expected}"))
+                        && s.contains("Binance Perp 1000PEPEUSDT")
+                        && s.contains("0.000004308 × 2000")
+                        && s.contains("0.008616 quote")
+                        && s.contains("…1234")),
+                "{labels:?}"
+            );
+            assert!(
+                !labels
+                    .iter()
+                    .any(|s| s.contains(&format!("ORDER {absent}")))
+            );
+            assert!(
+                labels
+                    .iter()
+                    .any(|s| s == if left { "#buy-id" } else { "#sell-id" })
+            );
+            if left {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|s| s.contains("Hyperliquid Perp kPEPE") && s.contains("…5678"))
+                );
+                assert!(labels.iter().any(|s| s == "#second-buy"));
+            }
+        }
+    }
 
     #[test]
     fn grouping_options_remain_open_inside_widget_config() {
@@ -1487,6 +1746,7 @@ mod tests {
             units: Units::Quote,
             compact: true,
             trade_stream: true,
+            show_fills: false,
             total_liquidity: false,
         };
         let saved = serde_json::to_string(&pane).unwrap();
@@ -1498,6 +1758,7 @@ mod tests {
         assert_eq!(restored.dom.units, Units::Quote);
         assert!(restored.dom.compact);
         assert!(restored.dom.trade_stream);
+        assert!(!restored.dom.show_fills);
     }
 
     #[test]
@@ -1507,6 +1768,7 @@ mod tests {
                 .unwrap();
         assert!(!settings.compact);
         assert!(!settings.trade_stream);
+        assert!(settings.show_fills);
         assert_eq!(settings.window_secs, 120);
     }
 
@@ -1585,7 +1847,21 @@ mod tests {
                             ..Default::default()
                         },
                         |ui| {
-                            super::ui(ui, Some(&data), None, &settings, &mut view, &own_orders);
+                            super::ui(
+                                ui,
+                                Some(&data),
+                                None,
+                                &settings,
+                                &mut view,
+                                &own_orders,
+                                &[],
+                                &HashMap::new(),
+                                &Market {
+                                    exchange: account.exchange,
+                                    kind: terminal_core::MarketKind::Perp,
+                                    symbol: "BTC".into(),
+                                },
+                            );
                         },
                     );
                     output.textures_delta.clear();

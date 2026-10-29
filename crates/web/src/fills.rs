@@ -9,6 +9,138 @@ use crate::{
     view::quote_size_text,
 };
 
+// Render private executions independently of public/aggregated trade messages.
+fn marker_values(
+    fill: &OwnFill,
+    multiplier: u64,
+) -> Option<(
+    rust_decimal::Decimal,
+    rust_decimal::Decimal,
+    rust_decimal::Decimal,
+)> {
+    use rust_decimal::Decimal;
+    let price: Decimal = fill.price.parse().ok()?;
+    let size: Decimal = fill.size.parse().ok()?;
+    if price <= Decimal::ZERO || size <= Decimal::ZERO || multiplier == 0 {
+        return None;
+    }
+    Some((
+        price.checked_div(multiplier.into())?,
+        size.checked_mul(multiplier.into())?,
+        price.checked_mul(size)?,
+    ))
+}
+
+pub fn plot_price(fill: &OwnFill, multiplier: u64) -> Option<f64> {
+    use rust_decimal::prelude::ToPrimitive;
+    marker_values(fill, multiplier)?.0.to_f64()
+}
+
+fn diamond(painter: &egui::Painter, center: Pos2, radius: f32, side: TradeSide) {
+    let color = crate::view::trade_color(side, MUTED);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            center + Vec2::new(0.0, -radius),
+            center + Vec2::new(radius, 0.0),
+            center + Vec2::new(0.0, radius),
+            center + Vec2::new(-radius, 0.0),
+        ],
+        color,
+        Stroke::new(1.4, TEXT),
+    ));
+}
+
+pub fn overlay(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    plot: Rect,
+    fills: &[(usize, &Account, &OwnFill)],
+    catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
+    point: impl Fn(usize, &OwnFill) -> Option<(Pos2, u64)>,
+) -> bool {
+    use rust_decimal::prelude::ToPrimitive;
+    let painter = ui.painter_at(plot);
+    let pointer = response.hover_pos().filter(|p| plot.contains(*p));
+    let mut hovered = None;
+    let mut best_distance = f32::INFINITY;
+    for (index, account, fill) in fills {
+        let Some((position, multiplier)) = point(*index, fill)
+            .filter(|(p, _)| p.x.is_finite() && p.y.is_finite() && plot.contains(*p))
+        else {
+            continue;
+        };
+        let Some((price, size, quote)) = marker_values(fill, multiplier) else {
+            continue;
+        };
+        let radius = crate::view::quote_dot_radius(quote.to_f64().unwrap_or(0.0)) + 2.4;
+        diamond(&painter, position, radius, fill.side);
+        if let Some(pointer) = pointer {
+            let distance = position.distance_sq(pointer);
+            if distance <= (radius + 4.0).powi(2) && distance <= best_distance {
+                best_distance = distance;
+                hovered = Some((
+                    distance, position, radius, *account, *fill, multiplier, price, size, quote,
+                ));
+            }
+        }
+    }
+    if let Some((_, position, radius, account, fill, multiplier, price, size, quote)) = hovered {
+        diamond(&painter, position, radius + 1.5, fill.side);
+        response.clone().on_hover_ui_at_pointer(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Your fill · {}",
+                    match fill.side {
+                        TradeSide::Buy => "BUY",
+                        TradeSide::Sell => "SELL",
+                        TradeSide::Unknown => "TRADE",
+                    }
+                ))
+                .color(crate::view::trade_color(fill.side, TEXT)),
+            );
+            ui.label(format!(
+                "{} {} · {}",
+                fill.market.exchange.label(),
+                fill.market.kind.label(),
+                fill.market.symbol
+            ));
+            ui.weak(format!(
+                "Account {}…{}",
+                &account.address[..account.address.len().min(6)],
+                &account.address[account.address.len().saturating_sub(4)..]
+            ));
+            ui.label(format!(
+                "{} UTC · {}",
+                crate::view::trade_utc(fill.time_ms, false),
+                if fill.taker { "Taker" } else { "Maker" }
+            ));
+            let info = orderflow::symbol_info(&fill.market, catalogs);
+            let base = info.map_or("base", |info| {
+                if multiplier > 1 {
+                    orderflow::base_units(&info.base, fill.market.kind).0
+                } else {
+                    &info.base
+                }
+            });
+            let quote_unit = info.map_or("quote", |info| info.quote.as_str());
+            egui::Grid::new("own-fill-tooltip").show(ui, |ui| {
+                for (label, value) in [
+                    ("Price", price.normalize().to_string()),
+                    ("Size", format!("{} {base}", size.normalize())),
+                    ("Quote size", format!("{} {quote_unit}", quote.normalize())),
+                ] {
+                    ui.weak(label);
+                    ui.monospace(value);
+                    ui.end_row();
+                }
+            });
+        });
+        true
+    } else {
+        false
+    }
+}
+
 const QUOTE_FRESH_MS: i64 = 2_000;
 const SETTLE_MS: i64 = 250;
 const MAX_QUOTES: usize = 25_000;
@@ -91,6 +223,35 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn visible_sources<'a>(
+        &'a self,
+        markets: &[Market],
+        accounts: &[Account],
+        hidden: &HashSet<Account>,
+    ) -> Vec<(usize, &'a Account, &'a OwnFill)> {
+        let mut rows: Vec<_> = self
+            .histories
+            .iter()
+            .filter(|(account, _)| accounts.contains(account) && !hidden.contains(account))
+            .flat_map(|(account, fills)| fills.iter().map(move |fill| (account, fill)))
+            .filter_map(|(account, fill)| {
+                if account.exchange != fill.market.exchange {
+                    return None;
+                }
+                Some((
+                    markets.iter().position(|market| market == &fill.market)?,
+                    account,
+                    fill,
+                ))
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| {
+            a.2.key()
+                .cmp(&b.2.key())
+                .then(a.1.address.cmp(&b.1.address))
+        });
+        rows
+    }
     pub fn push(&mut self, account: Account, fills: Vec<OwnFill>) {
         terminal_core::merge_account_fills(self.histories.entry(account).or_default(), fills);
     }
@@ -822,6 +983,293 @@ mod tests {
         data.fill_quotes.push(10_500, 100.01, 100.03, 10_600);
         data.fill_quotes.push(11_100, 101.0, 101.02, 11_150);
         data
+    }
+
+    #[test]
+    fn own_markers_use_visible_accounts_and_exact_source_identity() {
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        let removed = Account {
+            address: "0x5678".into(),
+            ..account.clone()
+        };
+        let fill = fill(TradeSide::Buy);
+        let mut wrong_kind = fill.clone();
+        wrong_kind.market.kind = if fill.market.kind == MarketKind::Spot {
+            MarketKind::Perp
+        } else {
+            MarketKind::Spot
+        };
+        let mut wrong_venue = fill.clone();
+        wrong_venue.market.exchange = Exchange::Bybit;
+        wrong_venue.trade_id = 3;
+        let mut store = Store::default();
+        store.push(account.clone(), vec![fill.clone(), wrong_kind, wrong_venue]);
+        store.push(removed, vec![fill.clone()]);
+        let markets = [fill.market.clone(), fill.market.clone()];
+        let accounts = [account.clone()];
+        let rows = store.visible_sources(&markets, &accounts, &HashSet::new());
+        assert_eq!(
+            rows.len(),
+            1,
+            "no removed, different-market or duplicate-source markers"
+        );
+        assert_eq!(rows[0].0, 0);
+        assert!(
+            store
+                .visible_sources(&markets, &accounts, &HashSet::from([account]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn own_marker_normalization_preserves_quote_value_and_rejects_invalid_sizes() {
+        let mut fill = fill(TradeSide::Buy);
+        fill.price = "0.004308".into();
+        fill.size = "2".into();
+        let (price, size, quote) = marker_values(&fill, 1000).unwrap();
+        assert_eq!(price.to_string(), "0.000004308");
+        assert_eq!(size.to_string(), "2000");
+        assert_eq!(price * size, quote);
+        assert_eq!(quote.to_string(), "0.008616");
+        assert!(marker_values(&fill, 0).is_none());
+        for invalid in ["-1", "0", "NaN", "inf"] {
+            fill.size = invalid.into();
+            assert!(marker_values(&fill, 1).is_none());
+        }
+    }
+
+    #[test]
+    fn private_fills_render_on_prices_and_both_dom_modes_without_public_trades() {
+        use terminal_core::{Book, Level};
+        let now = utc_now_ms();
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        let mut buy = fill(TradeSide::Buy);
+        buy.time_ms = now - 2_000;
+        let mut sell = fill(TradeSide::Sell);
+        sell.time_ms = now - 1_000;
+        sell.size = "100".into();
+        let market = buy.market.clone();
+        let other = Market::for_exchange_kind(Exchange::Okx, market.kind);
+        let data: HashMap<_, _> = [market.clone(), other.clone()]
+            .into_iter()
+            .map(|market| {
+                (
+                    market,
+                    MarketData {
+                        connected: true,
+                        book: Some(Book {
+                            bids: vec![Level {
+                                price: "99".into(),
+                                size: "1".into(),
+                                quote_size: String::new(),
+                                depth_base: String::new(),
+                                depth_quote: String::new(),
+                            }],
+                            asks: vec![Level {
+                                price: "101".into(),
+                                size: "1".into(),
+                                quote_size: String::new(),
+                                depth_base: String::new(),
+                                depth_quote: String::new(),
+                            }],
+                            updated_at_ms: now,
+                        }),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let catalogs: HashMap<_, _> = [market.clone(), other.clone()]
+            .into_iter()
+            .map(|m| {
+                (
+                    (m.exchange, m.kind),
+                    vec![SymbolInfo {
+                        symbol: m.symbol,
+                        base: "BTC".into(),
+                        quote: "USDC".into(),
+                        base_token_id: None,
+                        market_id: None,
+                        size_multiplier: None,
+                        price_step: Some("1".into()),
+                    }],
+                )
+            })
+            .collect();
+        for variant in 0..3 {
+            for visible in [true, false] {
+                let ctx = egui::Context::default();
+                let render = || {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1000.0, 650.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let rows = if visible {
+                                vec![(0, &account, &buy), (0, &account, &sell)]
+                            } else {
+                                Vec::new()
+                            };
+                            let settings = serde_json::from_str::<crate::dom::Settings>(
+                                r#"{"trade_stream":true}"#,
+                            )
+                            .unwrap();
+                            match variant {
+                                0 => crate::view::compare_ui(
+                                    ui,
+                                    std::slice::from_ref(&market),
+                                    &data,
+                                    crate::CompareMode::Trades,
+                                    false,
+                                    60,
+                                    &mut orderflow::Settings::default(),
+                                    &catalogs,
+                                    &[],
+                                    &rows,
+                                    &mut crate::view::YAxisView::default(),
+                                ),
+                                1 => crate::dom::ui(
+                                    ui,
+                                    data.get(&market),
+                                    orderflow::symbol_info(&market, &catalogs),
+                                    &settings,
+                                    &mut crate::dom::View::default(),
+                                    &[],
+                                    &rows,
+                                    &catalogs,
+                                    &market,
+                                ),
+                                _ => crate::dom::multi_ui(
+                                    ui,
+                                    &[market.clone(), other.clone()],
+                                    &data,
+                                    &catalogs,
+                                    &settings,
+                                    &mut crate::dom::View::default(),
+                                    &[],
+                                    &rows,
+                                ),
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                render();
+                let output = render();
+                let marks: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Path(path)
+                            if path.closed
+                                && path.points.len() == 4
+                                && path.stroke.color == egui::epaint::ColorMode::Solid(TEXT)
+                                && (path.stroke.width - 1.4).abs() < 0.01 =>
+                        {
+                            Some(path)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    marks.len(),
+                    if visible { 2 } else { 0 },
+                    "variant {variant}, visible {visible}"
+                );
+                if visible {
+                    assert_eq!(marks[0].fill, GREEN);
+                    assert_eq!(marks[1].fill, RED);
+                    assert!(
+                        marks[1].points[1].x - marks[1].points[3].x
+                            > marks[0].points[1].x - marks[0].points[3].x,
+                        "larger execution has a larger marker"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn own_fill_hover_shows_normalized_base_and_quote_sizes() {
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        let mut fill = fill(TradeSide::Buy);
+        fill.price = "0.004308".into();
+        fill.size = "2".into();
+        let catalogs = HashMap::from([(
+            (fill.market.exchange, fill.market.kind),
+            vec![SymbolInfo {
+                symbol: fill.market.symbol.clone(),
+                base: "kPEPE".into(),
+                quote: "USDC".into(),
+                base_token_id: None,
+                market_id: None,
+                size_multiplier: None,
+                price_step: None,
+            }],
+        )]);
+        let mut labels = Vec::new();
+        let mut pointer = Pos2::ZERO;
+        for frame in 0..4 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 500.0))),
+                    time: Some(frame as f64),
+                    events: vec![egui::Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let (plot, response) =
+                        ui.allocate_exact_size(Vec2::new(300.0, 220.0), Sense::hover());
+                    pointer = plot.center();
+                    let hovered = overlay(
+                        ui,
+                        &response,
+                        plot,
+                        &[(0, &account, &fill)],
+                        &catalogs,
+                        |_, _| Some((plot.center(), 1000)),
+                    );
+                    if frame > 1 {
+                        assert!(hovered);
+                    }
+                },
+            );
+            labels.extend(output.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            }));
+            output.textures_delta.clear();
+        }
+        for expected in [
+            "Your fill · BUY",
+            "0.000004308",
+            "2000 PEPE",
+            "0.008616 USDC",
+        ] {
+            assert!(
+                labels.iter().any(|s| s == expected),
+                "missing hover detail {expected}"
+            );
+        }
     }
 
     #[test]

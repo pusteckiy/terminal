@@ -207,6 +207,7 @@ struct Pane {
     compare_mode: CompareMode,
     compare_window_secs: u32,
     compare_show_orders: bool,
+    compare_show_fills: bool,
     orderflow: orderflow::Settings,
     dom: dom::Settings,
     fills: fills::Settings,
@@ -254,6 +255,7 @@ impl Pane {
             compare_mode: CompareMode::default(),
             compare_window_secs: default_compare_window_secs(),
             compare_show_orders: default_compare_show_orders(),
+            compare_show_fills: true,
             orderflow: orderflow::Settings::default(),
             dom: dom::Settings::default(),
             fills: fills::Settings::default(),
@@ -315,6 +317,8 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_window_secs: u32,
                 #[serde(default = "default_compare_show_orders")]
                 compare_show_orders: bool,
+                #[serde(default = "default_compare_show_orders")]
+                compare_show_fills: bool,
                 #[serde(default)]
                 orderflow: orderflow::Settings,
                 #[serde(default)]
@@ -340,6 +344,7 @@ impl<'de> Deserialize<'de> for Pane {
                 compare_mode,
                 compare_window_secs,
                 compare_show_orders,
+                compare_show_fills,
                 orderflow,
                 dom,
                 fills,
@@ -363,6 +368,7 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.compare_mode = compare_mode;
                 pane.compare_window_secs = compare_window_secs.clamp(10, 600);
                 pane.compare_show_orders = compare_show_orders;
+                pane.compare_show_fills = compare_show_fills;
                 pane.orderflow = orderflow;
                 pane.dom = dom;
                 pane.fills = fills;
@@ -1534,6 +1540,7 @@ fn compare_editor(
     }
     ui.checkbox(&mut pane.orderflow.enabled, "Show orderflow")
         .on_hover_text("Live buy/sell volume grouped into UTC seconds; hover for delta");
+    ui.checkbox(&mut pane.compare_show_fills, "Show my fills");
     ui.checkbox(&mut pane.compare_show_orders, "Show account orders")
         .on_hover_text("Show open orders from visible accounts on this Prices widget");
     ui.label(
@@ -2167,6 +2174,12 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 } else {
                     Vec::new()
                 };
+                let own_fills = if pane.compare_show_fills {
+                    self.fills
+                        .visible_sources(sources, self.accounts, self.hidden_widget_accounts)
+                } else {
+                    Vec::new()
+                };
                 view::compare_ui(
                     ui,
                     sources,
@@ -2177,6 +2190,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                     &mut pane.orderflow,
                     self.catalogs,
                     &orders,
+                    &own_fills,
                     &mut pane.compare_view,
                 );
             }
@@ -2216,6 +2230,12 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Dom => {
+                let own_fills = if pane.dom.shows_fills() {
+                    self.fills
+                        .visible_sources(sources, self.accounts, self.hidden_widget_accounts)
+                } else {
+                    Vec::new()
+                };
                 self.needed_catalogs
                     .extend(sources.iter().map(|market| (market.exchange, market.kind)));
                 if pane.series.len() > 1 {
@@ -2232,6 +2252,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                         &pane.dom,
                         &mut pane.dom_view,
                         &orders,
+                        &own_fills,
                     );
                 } else if sources.is_empty() {
                     ui.weak("No available DOM sources. Choose a market in config.");
@@ -2243,6 +2264,9 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                         &pane.dom,
                         &mut pane.dom_view,
                         &own_orders,
+                        &own_fills,
+                        self.catalogs,
+                        market,
                     );
                 }
             }
@@ -3187,13 +3211,16 @@ mod tests {
         assert_eq!(pane.compare_mode, CompareMode::Trades);
         assert_eq!(pane.compare_window_secs, 60);
         assert!(pane.compare_show_orders);
+        assert!(pane.compare_show_fills);
         assert!(!pane.orderflow.enabled);
         let mut pane = pane;
         pane.compare_show_orders = false;
+        pane.compare_show_fills = false;
         pane.orderflow.enabled = true;
         pane.orderflow.source = Some(pane.series[0].clone());
         let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
         assert!(!restored.compare_show_orders);
+        assert!(!restored.compare_show_fills);
         assert!(restored.orderflow.enabled);
         assert_eq!(restored.orderflow.source, Some(pane.series[0].clone()));
     }

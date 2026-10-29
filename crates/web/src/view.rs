@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use terminal_core::{
-    Account, Book, Candle, Exchange, Level, Market, MarketKind, OwnOrder, Position, SymbolInfo,
-    Trade, TradeSide,
+    Account, Book, Candle, Exchange, Level, Market, MarketKind, OwnFill, OwnOrder, Position,
+    SymbolInfo, Trade, TradeSide,
 };
 
 use crate::orderflow::{self, Bucket, Settings as OrderflowSettings, Units};
@@ -1292,7 +1292,10 @@ pub(super) fn venue_color(exchange: Exchange) -> Color32 {
 }
 
 pub(super) fn trade_dot_radius(trade: &TradePoint) -> f32 {
-    let quote_size = trade.price * trade.size;
+    quote_dot_radius(trade.price * trade.size)
+}
+
+pub(super) fn quote_dot_radius(quote_size: f64) -> f32 {
     if !quote_size.is_finite() || quote_size <= 0.0 {
         return 1.6;
     }
@@ -1618,6 +1621,7 @@ pub fn compare_ui(
     flow_settings: &mut OrderflowSettings,
     catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
     orders: &[(usize, &Account, &OwnOrder)],
+    own_fills: &[(usize, &Account, &OwnFill)],
     view: &mut YAxisView,
 ) {
     let multipliers: Vec<_> = markets
@@ -1701,6 +1705,7 @@ pub fn compare_ui(
                 .map(|price| price.time_ms),
             CompareMode::BestBidAsk => market_data.quotes.back().map(|quote| quote.time_ms),
         })
+        .chain(own_fills.iter().map(|(_, _, fill)| fill.time_ms))
         .max();
     let Some(end_ms) = end_ms else {
         painter.text(
@@ -1757,9 +1762,20 @@ pub fn compare_ui(
             }
         }
     }
+    let fill_points: Vec<_> = own_fills
+        .iter()
+        .filter_map(|(index, _, fill)| {
+            if !(cutoff_ms..=end_ms).contains(&fill.time_ms) {
+                return None;
+            }
+            let price = crate::fills::plot_price(fill, *multipliers.get(*index)?)?;
+            Some((fill.time_ms, comparison_value(price, reference)))
+        })
+        .collect();
     let Some(first_ms) = lines
         .iter()
         .flat_map(|(points, _, _)| points.iter().map(|(time, _)| *time))
+        .chain(fill_points.iter().map(|(time, _)| *time))
         .min()
     else {
         return;
@@ -1769,10 +1785,12 @@ pub fn compare_ui(
     let low = lines
         .iter()
         .flat_map(|(points, _, _)| points.iter().map(|(_, price)| *price))
+        .chain(fill_points.iter().map(|(_, price)| *price))
         .fold(f64::INFINITY, f64::min);
     let high = lines
         .iter()
         .flat_map(|(points, _, _)| points.iter().map(|(_, price)| *price))
+        .chain(fill_points.iter().map(|(_, price)| *price))
         .fold(f64::NEG_INFINITY, f64::max);
     if !low.is_finite() || !high.is_finite() {
         return;
@@ -1891,7 +1909,7 @@ pub fn compare_ui(
             color,
         );
     }
-    let hovered_order = response
+    let mut hovered_order = response
         .hover_pos()
         .filter(|pointer| plot.contains(*pointer))
         .and_then(|pointer| {
@@ -1950,6 +1968,24 @@ pub fn compare_ui(
             }
         }
     }
+    let hovered_fill =
+        crate::fills::overlay(ui, &response, plot, own_fills, catalogs, |index, fill| {
+            if !(start_ms..=end_ms).contains(&fill.time_ms) {
+                return None;
+            }
+            let multiplier = *multipliers.get(index)?;
+            let price = crate::fills::plot_price(fill, multiplier)?;
+            Some((
+                Pos2::new(
+                    x_for(fill.time_ms),
+                    y_for(comparison_value(price, reference)),
+                ),
+                multiplier,
+            ))
+        });
+    if hovered_fill {
+        hovered_order = None;
+    }
     if let Some(pointer) = response.hover_pos().filter(|pos| plot.contains(*pos)) {
         painter.line_segment(
             [
@@ -1958,7 +1994,7 @@ pub fn compare_ui(
             ],
             Stroke::new(1.0, MUTED),
         );
-        if mode == CompareMode::Trades && hovered_order.is_none() {
+        if mode == CompareMode::Trades && hovered_order.is_none() && !hovered_fill {
             let mut nearest: Option<(f32, &Market, &TradePoint, Pos2, usize)> = None;
             for (index, market) in markets.iter().enumerate() {
                 let Some(market_data) = data.get(market) else {
@@ -2040,7 +2076,7 @@ pub fn compare_ui(
         );
         if let Some(pointer) = response
             .hover_pos()
-            .filter(|pointer| plot.contains(*pointer) || flow.contains(*pointer))
+            .filter(|pointer| !hovered_fill && (plot.contains(*pointer) || flow.contains(*pointer)))
         {
             painter.line_segment(
                 [
@@ -2146,32 +2182,8 @@ pub fn compare_ui(
     if let Some((index, account, order, y)) = hovered_order {
         let market = &markets[*index];
         let color = trade_color(order.side, MUTED);
-        let quote_size = order
-            .price
-            .parse::<rust_decimal::Decimal>()
-            .ok()
-            .zip(order.size.parse::<rust_decimal::Decimal>().ok())
-            .and_then(|(price, size)| price.checked_mul(size))
-            .map(|value| quote_size_text(&value.to_string()))
-            .unwrap_or_else(|| "—".to_owned());
-        let multiplier = multipliers[*index];
-        let price = comparison_price(&order.price, multiplier).unwrap_or_else(|| "—".into());
-        let size = order
-            .size
-            .parse::<rust_decimal::Decimal>()
-            .ok()
-            .and_then(|size| size.checked_mul(multiplier.into()))
-            .map(|size| size.normalize().to_string())
-            .unwrap_or_else(|| "—".into());
-        let details = format!("{price} × {size} · {quote_size} quote");
+        let (mut label, details) = order_details(market, account, order, multipliers[*index]);
         let account_suffix = &account.address[account.address.len().saturating_sub(4)..];
-        let mut label = format!(
-            "ORDER {} · {} {} {} · {details} · …{account_suffix}",
-            trade_side_label(order.side),
-            venue_code(market.exchange),
-            market.kind.label(),
-            market.symbol,
-        );
         let font = FontId::monospace(9.0);
         let header = Rect::from_min_max(
             Pos2::new(plot.left(), rect.top()),
@@ -2204,6 +2216,42 @@ pub fn compare_ui(
             color,
         );
     }
+}
+
+pub(crate) fn order_details(
+    market: &Market,
+    account: &Account,
+    order: &OwnOrder,
+    multiplier: u64,
+) -> (String, String) {
+    let quote_size = order
+        .price
+        .parse::<rust_decimal::Decimal>()
+        .ok()
+        .zip(order.size.parse::<rust_decimal::Decimal>().ok())
+        .and_then(|(price, size)| price.checked_mul(size))
+        .map(|value| quote_size_text(&value.to_string()))
+        .unwrap_or_else(|| "—".to_owned());
+    let price = comparison_price(&order.price, multiplier).unwrap_or_else(|| "—".into());
+    let size = order
+        .size
+        .parse::<rust_decimal::Decimal>()
+        .ok()
+        .and_then(|size| size.checked_mul(multiplier.into()))
+        .map(|size| size.normalize().to_string())
+        .unwrap_or_else(|| "—".into());
+    let details = format!("{price} × {size} · {quote_size} quote");
+    let account_suffix = &account.address[account.address.len().saturating_sub(4)..];
+    (
+        format!(
+            "ORDER {} · {} {} {} · {details} · …{account_suffix}",
+            trade_side_label(order.side),
+            market.exchange.label(),
+            market.kind.label(),
+            market.symbol
+        ),
+        details,
+    )
 }
 
 fn orderflow_source_ui(
@@ -2422,6 +2470,102 @@ mod tests {
     use terminal_core::{Account, Exchange, LastPrice, Level, Market, OwnOrder, Trade, TradeSide};
 
     #[test]
+    fn own_fills_share_public_trade_coordinates_in_price_and_percent_modes() {
+        use super::*;
+        let market = Market {
+            exchange: Exchange::Hyperliquid,
+            kind: MarketKind::Perp,
+            symbol: "kPEPE".into(),
+        };
+        let account = Account {
+            exchange: market.exchange,
+            address: "0x1234".into(),
+        };
+        let fill = OwnFill {
+            order_external_id: None,
+            execution_id: None,
+            market: market.clone(),
+            time_ms: 10000,
+            trade_id: 1,
+            order_id: 1,
+            side: TradeSide::Buy,
+            price: "0.004308".into(),
+            size: "2".into(),
+            start_position: None,
+            taker: false,
+            fee: String::new(),
+            fee_token: String::new(),
+        };
+        let mut feed = MarketData::default();
+        feed.push_trade(Trade {
+            price: fill.price.clone(),
+            size: fill.size.clone(),
+            time_ms: fill.time_ms,
+            side: fill.side,
+        });
+        let data = HashMap::from([(market.clone(), feed)]);
+        let catalogs = HashMap::from([(
+            (market.exchange, market.kind),
+            vec![SymbolInfo {
+                symbol: market.symbol.clone(),
+                base: "kPEPE".into(),
+                quote: "USDC".into(),
+                base_token_id: None,
+                market_id: None,
+                size_multiplier: None,
+                price_step: None,
+            }],
+        )]);
+        for percent in [false, true] {
+            let ctx = egui::Context::default();
+            let render = || {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        compare_ui(
+                            ui,
+                            std::slice::from_ref(&market),
+                            &data,
+                            CompareMode::Trades,
+                            percent,
+                            60,
+                            &mut OrderflowSettings::default(),
+                            &catalogs,
+                            &[],
+                            &[(0, &account, &fill)],
+                            &mut YAxisView::default(),
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                output
+            };
+            render();
+            let output = render();
+            let diamond = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Path(p)
+                        if p.closed
+                            && p.points.len() == 4
+                            && p.fill == GREEN
+                            && p.stroke.color == egui::epaint::ColorMode::Solid(TEXT) =>
+                    {
+                        Some(p)
+                    }
+                    _ => None,
+                })
+                .expect("own fill is visible");
+            let center = (diamond.points[0] + diamond.points[2].to_vec2()) / 2.0;
+            assert!(output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Circle(c) if c.fill==GREEN && c.center.distance(center)<0.01)),"own and public trade must share coordinates, percent={percent}");
+        }
+    }
+
+    #[test]
     fn source_colors_stay_with_the_exchange_when_widgets_have_different_orders() {
         let colors: Vec<_> = Exchange::ALL.into_iter().map(super::venue_color).collect();
         for (index, color) in colors.iter().enumerate() {
@@ -2602,6 +2746,7 @@ mod tests {
                             &mut orderflow::Settings::default(),
                             &catalogs,
                             &[(3, &account, &order)],
+                            &[],
                             &mut YAxisView::default(),
                         )
                     },

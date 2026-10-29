@@ -135,6 +135,7 @@ pub fn ui(
     settings: &Settings,
     view: &mut View,
     orders: &[(usize, &Account, &OwnOrder)],
+    own_fills: &[(usize, &Account, &OwnFill)],
 ) {
     view.hidden_sources
         .retain(|market| markets.contains(market));
@@ -377,6 +378,18 @@ pub fn ui(
                 );
                 low = low.min(bounds.0 / source.multiplier);
                 high = high.max(bounds.1 / source.multiplier);
+            }
+        }
+        if settings.trade_stream && settings.show_fills {
+            for (index, _, fill) in own_fills {
+                if (0..i64::from(window) * 1000).contains(&(now_ms - fill.time_ms))
+                    && let Some(source) = sources.iter().find(|source| source.index == *index)
+                    && let Some(price) = positive(&fill.price)
+                {
+                    let price = group(price / source.multiplier, step);
+                    low = low.min(price);
+                    high = high.max(price);
+                }
             }
         }
         view.anchor = view.anchor.map(|price| price.clamp(low, high));
@@ -699,6 +712,42 @@ pub fn ui(
             );
         }
     }
+    let mut hovered_fill = false;
+    if settings.trade_stream && settings.show_fills {
+        hovered_fill =
+            crate::fills::overlay(ui, &response, plot, own_fills, catalogs, |index, fill| {
+                let source = sources.iter().find(|source| source.index == index)?;
+                if !(start_ms..=now_ms).contains(&fill.time_ms) {
+                    return None;
+                }
+                let price = positive(&fill.price)? / source.multiplier;
+                Some((
+                    Pos2::new(x_for(fill.time_ms), level_y(price, top_price, step, plot)),
+                    source.multiplier.to_u64()?,
+                ))
+            });
+    }
+    if settings.trade_stream && !hovered_fill {
+        order_hover(
+            ui,
+            &response,
+            plot,
+            orders.iter().filter_map(|(index, account, order)| {
+                let source = sources
+                    .iter()
+                    .find(|source| source.index == *index && source.book().is_some())?;
+                let price = positive(&order.price)? / source.multiplier;
+                positive(&order.size)?;
+                Some((
+                    source.market,
+                    *account,
+                    *order,
+                    source.multiplier.to_u64()?,
+                    level_y(price, top_price, step, plot),
+                ))
+            }),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -865,7 +914,16 @@ mod tests {
                             ..Default::default()
                         },
                         |ui| {
-                            super::ui(ui, &markets, &data, &catalogs, &settings, &mut view, &[]);
+                            super::ui(
+                                ui,
+                                &markets,
+                                &data,
+                                &catalogs,
+                                &settings,
+                                &mut view,
+                                &[],
+                                &[],
+                            );
                         },
                     );
                     output.textures_delta.clear();
@@ -946,6 +1004,7 @@ mod tests {
                     &settings,
                     &mut View::default(),
                     &[],
+                    &[],
                 );
             },
         );
@@ -982,7 +1041,18 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| super::ui(ui, &markets, &data, &catalogs, &settings, &mut view, &[]),
+                |ui| {
+                    super::ui(
+                        ui,
+                        &markets,
+                        &data,
+                        &catalogs,
+                        &settings,
+                        &mut view,
+                        &[],
+                        &[],
+                    )
+                },
             );
             output.textures_delta.clear();
             output
@@ -1048,6 +1118,7 @@ mod tests {
                         catalogs,
                         &settings,
                         &mut View::default(),
+                        &[],
                         &[],
                     )
                 },
