@@ -3,7 +3,9 @@ mod audio;
 mod batch;
 mod candles;
 mod dom;
+mod events;
 mod fills;
+mod imbalance;
 mod orderflow;
 mod position;
 mod private;
@@ -162,6 +164,8 @@ enum WidgetKind {
     Dom,
     Fills,
     Position,
+    Imbalance,
+    Events,
 }
 
 impl WidgetKind {
@@ -174,6 +178,8 @@ impl WidgetKind {
             Self::Dom => "DOM",
             Self::Fills => "Fills",
             Self::Position => "Position",
+            Self::Imbalance => "Order Book Imbalance",
+            Self::Events => "Market Events",
         }
     }
 
@@ -186,6 +192,8 @@ impl WidgetKind {
             Self::Dom => "DOM",
             Self::Fills => "FILLS",
             Self::Position => "POSITION",
+            Self::Imbalance => "IMBALANCE",
+            Self::Events => "EVENTS",
         }
     }
 }
@@ -212,10 +220,14 @@ struct Pane {
     dom: dom::Settings,
     fills: fills::Settings,
     position: position::Settings,
+    imbalance: imbalance::Settings,
+    events: events::Settings,
     unavailable_markets: Vec<Market>,
     batch_symbol: Option<String>,
     #[serde(skip)]
     position_view: position::View,
+    #[serde(skip)]
+    imbalance_view: imbalance::View,
     #[serde(skip)]
     fills_view: fills::View,
     #[serde(skip)]
@@ -241,7 +253,10 @@ impl Pane {
                 Market::for_exchange(Exchange::Binance),
                 Market::for_exchange(Exchange::Hyperliquid),
             ]
-        } else if matches!(kind, WidgetKind::Dom) {
+        } else if matches!(
+            kind,
+            WidgetKind::Dom | WidgetKind::Imbalance | WidgetKind::Events
+        ) {
             vec![market.clone()]
         } else {
             Vec::new()
@@ -260,9 +275,12 @@ impl Pane {
             dom: dom::Settings::default(),
             fills: fills::Settings::default(),
             position: position::Settings::default(),
+            imbalance: imbalance::Settings::default(),
+            events: events::Settings::default(),
             unavailable_markets: Vec::new(),
             batch_symbol: None,
             position_view: position::View::default(),
+            imbalance_view: imbalance::View::default(),
             fills_view: fills::View::default(),
             dom_view: dom::View::default(),
             chart: view::ChartView::default(),
@@ -279,7 +297,11 @@ impl Pane {
     fn uses_sources(&self) -> bool {
         matches!(
             self.kind,
-            WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom
+            WidgetKind::Compare
+                | WidgetKind::Tape
+                | WidgetKind::Dom
+                | WidgetKind::Imbalance
+                | WidgetKind::Events
         )
     }
 
@@ -290,7 +312,10 @@ impl Pane {
         } else if self.editing_series == to {
             self.editing_series = from;
         }
-        if matches!(self.kind, WidgetKind::Dom) {
+        if matches!(
+            self.kind,
+            WidgetKind::Dom | WidgetKind::Imbalance | WidgetKind::Events
+        ) {
             self.market = self.series[0].clone();
         }
     }
@@ -328,6 +353,10 @@ impl<'de> Deserialize<'de> for Pane {
                 #[serde(default)]
                 position: position::Settings,
                 #[serde(default)]
+                imbalance: imbalance::Settings,
+                #[serde(default)]
+                events: events::Settings,
+                #[serde(default)]
                 unavailable_markets: Vec<Market>,
                 #[serde(default)]
                 batch_symbol: Option<String>,
@@ -349,6 +378,8 @@ impl<'de> Deserialize<'de> for Pane {
                 dom,
                 fills,
                 position,
+                imbalance,
+                events,
                 unavailable_markets,
                 batch_symbol,
             } => {
@@ -356,11 +387,18 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.chart_timeframe = chart_timeframe;
                 if matches!(
                     kind,
-                    WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom
+                    WidgetKind::Compare
+                        | WidgetKind::Tape
+                        | WidgetKind::Dom
+                        | WidgetKind::Imbalance
+                        | WidgetKind::Events
                 ) && !series.is_empty()
                 {
                     pane.series = series;
-                    if matches!(kind, WidgetKind::Dom) {
+                    if matches!(
+                        kind,
+                        WidgetKind::Dom | WidgetKind::Imbalance | WidgetKind::Events
+                    ) {
                         pane.market = pane.series[0].clone();
                     }
                 }
@@ -373,6 +411,11 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.dom = dom;
                 pane.fills = fills;
                 pane.position = position;
+                pane.imbalance = imbalance;
+                pane.imbalance.levels = pane.imbalance.levels.clamp(1, 5000);
+                pane.imbalance.window_secs = pane.imbalance.window_secs.clamp(10, 600);
+                pane.events = events;
+                pane.events.window_secs = pane.events.window_secs.clamp(10, 600);
                 pane.unavailable_markets = unavailable_markets;
                 pane.batch_symbol = batch_symbol;
                 pane
@@ -397,6 +440,7 @@ struct MarketData {
     latest_trade: Option<TradePoint>,
     orderflow: orderflow::History,
     dom: dom::History,
+    events: events::History,
     trades: VecDeque<Trade>,
     quotes: VecDeque<QuoteTick>,
     fill_quotes: fills::QuoteHistory,
@@ -422,6 +466,7 @@ struct TradePoint {
 impl MarketData {
     fn push_trade(&mut self, trade: Trade) {
         self.dom.push(&trade);
+        self.events.trade(&trade);
         self.set_price(LastPrice {
             price: trade.price.clone(),
             time_ms: trade.time_ms,
@@ -476,13 +521,19 @@ impl MarketData {
         self.last_price = Some(last_price);
     }
 
-    fn set_book(&mut self, mut book: Book, exchange: Exchange) {
+    fn set_book(&mut self, mut book: Book, exchange: Exchange, observe_events: bool) {
         if self
             .book
             .as_ref()
             .is_some_and(|previous| book.updated_at_ms < previous.updated_at_ms)
         {
             return;
+        }
+        if observe_events
+            && self.connected
+            && let Some(previous) = &self.book
+        {
+            self.events.snapshot(previous, &book);
         }
         // REST/WS snapshots carry only price and base size. Derive quote sizes
         // and cumulative depth locally, once, preserving Decimal precision.
@@ -534,6 +585,9 @@ impl MarketData {
         };
         if updated_at_ms < book.updated_at_ms {
             return;
+        }
+        if self.connected {
+            self.events.delta(book, &bids, &asks, updated_at_ms);
         }
         apply_book_side(&mut book.bids, bids, true);
         apply_book_side(&mut book.asks, asks, false);
@@ -819,8 +873,17 @@ impl TerminalApp {
             return;
         }
         let mut wanted = HashSet::<Market>::new();
+        let mut event_markets = HashSet::new();
         for (_, tile) in self.workspaces[self.active_workspace].tiles.iter() {
             if let Tile::Pane(pane) = tile {
+                if matches!(pane.kind, WidgetKind::Events) {
+                    event_markets.extend(
+                        pane.series
+                            .iter()
+                            .filter(|m| !pane.unavailable_markets.contains(m))
+                            .cloned(),
+                    );
+                }
                 if matches!(pane.kind, WidgetKind::Fills) {
                     wanted.extend(self.fills.wanted_markets(
                         &pane.fills,
@@ -867,9 +930,20 @@ impl TerminalApp {
                 market: market.clone(),
             });
             self.data.remove(&market);
+            self.record_imbalance(Some(&market));
         }
         for market in added {
             self.send(ClientMessage::Subscribe { market });
+        }
+        for market in &event_markets {
+            self.data
+                .entry(market.clone())
+                .or_default()
+                .events
+                .set_enabled(true);
+        }
+        for (market, data) in &mut self.data {
+            data.events.set_enabled(event_markets.contains(market));
         }
         self.subscribed = wanted;
         let wanted_accounts: HashSet<_> = self
@@ -938,6 +1012,30 @@ impl TerminalApp {
                         self.data.get(&pane.market),
                         now,
                     );
+                }
+            }
+        }
+    }
+
+    fn record_imbalance(&mut self, changed: Option<&Market>) {
+        let now = utc_now_ms();
+        for tree in &mut self.workspaces {
+            for (_, tile) in tree.tiles.iter_mut() {
+                if let Tile::Pane(pane) = tile
+                    && matches!(pane.kind, WidgetKind::Imbalance)
+                {
+                    for market in &pane.series {
+                        if changed.is_none_or(|m| m == market)
+                            && !pane.unavailable_markets.contains(market)
+                        {
+                            pane.imbalance_view.observe(
+                                market,
+                                &pane.imbalance,
+                                self.data.get(market),
+                                now,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1025,6 +1123,13 @@ impl TerminalApp {
                         if !self.subscribed.contains(&market) {
                             continue;
                         }
+                        let book_changed = matches!(
+                            &message,
+                            ServerMessage::Snapshot { .. }
+                                | ServerMessage::Book { .. }
+                                | ServerMessage::BookDelta { .. }
+                                | ServerMessage::Status { .. }
+                        );
                         let exchange = market.exchange;
                         let data = self.data.entry(market.clone()).or_default();
                         match message {
@@ -1038,7 +1143,7 @@ impl TerminalApp {
                             } => {
                                 data.candles = candles;
                                 if let Some(book) = book {
-                                    data.set_book(book, exchange);
+                                    data.set_book(book, exchange, false);
                                 } else {
                                     data.book = None;
                                 }
@@ -1051,7 +1156,7 @@ impl TerminalApp {
                                 data.connected = connected;
                             }
                             ServerMessage::Book { book, .. } => {
-                                data.set_book(book, exchange);
+                                data.set_book(book, exchange, true);
                                 data.connected = true;
                             }
                             ServerMessage::BookDelta {
@@ -1104,6 +1209,9 @@ impl TerminalApp {
                             | ServerMessage::AccountPosition { .. } => {}
                         }
                         self.record_positions(Some(&market));
+                        if book_changed {
+                            self.record_imbalance(Some(&market));
+                        }
                     }
                 }
                 WsEvent::Closed | WsEvent::Error(_) => {
@@ -1136,6 +1244,7 @@ impl TerminalApp {
             data.fill_quotes = fills::QuoteHistory::default();
         }
         self.record_positions(None);
+        self.record_imbalance(None);
         self.sender = None;
         self.receiver = None;
         self.reconnect_at = socket::now_ms() + 3_000;
@@ -1338,6 +1447,8 @@ impl TerminalApp {
                                 WidgetKind::Dom,
                                 WidgetKind::Fills,
                                 WidgetKind::Position,
+                                WidgetKind::Imbalance,
+                                WidgetKind::Events,
                             ] {
                                 if ui.button(kind.label()).clicked() {
                                     add = Some(kind);
@@ -1964,6 +2075,24 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                     self.needed_catalogs,
                                     self.retry_catalogs,
                                 ),
+                                WidgetKind::Imbalance | WidgetKind::Events => {
+                                    sources_list(ui, pane);
+                                    ui.separator();
+                                    if matches!(pane.kind, WidgetKind::Imbalance) {
+                                        imbalance::config_ui(ui, &mut pane.imbalance);
+                                    } else {
+                                        events::config_ui(ui, &mut pane.events);
+                                    }
+                                    ui.separator();
+                                    selected_source_editor(
+                                        ui,
+                                        pane,
+                                        self.catalogs,
+                                        self.catalog_errors,
+                                        self.needed_catalogs,
+                                        self.retry_catalogs,
+                                    );
+                                }
                                 WidgetKind::Tape => {
                                     sources_list(ui, pane);
                                     ui.separator();
@@ -2059,6 +2188,11 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             || old_compare.2 != pane.compare_percent
         {
             if old_compare.0 != pane.series {
+                if matches!(pane.kind, WidgetKind::Imbalance | WidgetKind::Events)
+                    && let Some(first) = pane.series.first()
+                {
+                    pane.market = first.clone();
+                }
                 if matches!(pane.kind, WidgetKind::Dom) {
                     if let Some(first) = pane.series.first() {
                         pane.market = first.clone();
@@ -2195,6 +2329,23 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 );
             }
             WidgetKind::Tape => view::tape_ui(ui, sources, self.data),
+            WidgetKind::Imbalance => {
+                self.needed_catalogs
+                    .extend(sources.iter().map(|m| (m.exchange, m.kind)));
+                imbalance::ui(
+                    ui,
+                    sources,
+                    self.data,
+                    self.catalogs,
+                    &pane.imbalance,
+                    &mut pane.imbalance_view,
+                );
+            }
+            WidgetKind::Events => {
+                self.needed_catalogs
+                    .extend(sources.iter().map(|m| (m.exchange, m.kind)));
+                events::ui(ui, sources, self.data, self.catalogs, &mut pane.events);
+            }
             WidgetKind::Position => {
                 self.needed_catalogs
                     .insert((pane.market.exchange, pane.market.kind));
@@ -2470,6 +2621,206 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_events_count_live_book_changes_and_trades_but_not_snapshots() {
+        let level = |price: &str, size: &str| Level {
+            price: price.into(),
+            size: size.into(),
+            quote_size: String::new(),
+            depth_base: String::new(),
+            depth_quote: String::new(),
+        };
+        let book = Book {
+            bids: vec![level("100", "2"), level("99", "3")],
+            asks: vec![level("101", "4")],
+            updated_at_ms: 1000,
+        };
+        let mut data = MarketData::default();
+        data.events.set_enabled(true);
+        data.set_book(book.clone(), Exchange::Binance, false);
+        assert!(data.events.records.is_empty());
+        data.connected = true;
+        let mut next = book.clone();
+        next.updated_at_ms = 1100;
+        next.bids[0].size = "5".into();
+        data.set_book(next, Exchange::Binance, true);
+        data.apply_book_delta(
+            vec![
+                BookChange {
+                    price: "99".into(),
+                    size: "0".into(),
+                },
+                BookChange {
+                    price: "99.5".into(),
+                    size: "2".into(),
+                },
+            ],
+            vec![],
+            1200,
+            Exchange::Binance,
+        );
+        data.push_trade(Trade {
+            time_ms: 1250,
+            price: "100".into(),
+            size: "1".into(),
+            side: TradeSide::Buy,
+        });
+        let counts = data.events.seconds[&1];
+        assert_eq!(counts, [1, 1, 1, 1]);
+        data.set_book(book.clone(), Exchange::Binance, true);
+        assert_eq!(
+            data.events.seconds[&1], counts,
+            "stale books cannot produce events"
+        );
+        data.connected = false;
+        data.book = None;
+        let mut restored = book.clone();
+        restored.updated_at_ms = 1300;
+        data.set_book(restored, Exchange::Binance, true);
+        assert_eq!(
+            data.events.seconds[&1], counts,
+            "reconnection establishes a baseline"
+        );
+        data.events.set_enabled(false);
+        data.connected = true;
+        data.set_book(book, Exchange::Binance, true);
+        assert!(
+            data.events.records.is_empty(),
+            "no event allocation without a consumer"
+        );
+    }
+
+    #[test]
+    fn orderflow_widgets_receive_hidden_socket_updates_and_release_event_history() {
+        let mut app = test_app();
+        let market = Market::default();
+        app.workspaces = vec![Tree::new_horizontal(
+            "metrics",
+            vec![
+                Pane::new(WidgetKind::Imbalance, market.clone()),
+                Pane::new(WidgetKind::Events, market.clone()),
+            ],
+        )];
+        app.socket_open = true;
+        app.sync_subscriptions();
+        assert!(app.data[&market].events.enabled);
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        let level = |price: &str, size: &str| Level {
+            price: price.into(),
+            size: size.into(),
+            quote_size: String::new(),
+            depth_base: String::new(),
+            depth_quote: String::new(),
+        };
+        let book = Book {
+            bids: vec![level("100", "2")],
+            asks: vec![level("101", "4")],
+            updated_at_ms: crate::utc_now_ms(),
+        };
+        let mut changed = book.clone();
+        changed.updated_at_ms += 1;
+        changed.bids[0].size = "3".into();
+        for message in [
+            ServerMessage::Snapshot {
+                market: market.clone(),
+                candles: vec![],
+                book: Some(book),
+                best_bid_ask: None,
+                last_price: None,
+                connected: true,
+            },
+            ServerMessage::Book {
+                market: market.clone(),
+                book: changed,
+            },
+            ServerMessage::Trades {
+                market: market.clone(),
+                trades: vec![Trade {
+                    time_ms: crate::utc_now_ms(),
+                    price: "100".into(),
+                    size: "1".into(),
+                    side: TradeSide::Buy,
+                }],
+            },
+        ] {
+            assert!(
+                on_event(WsEvent::Message(WsMessage::Text(
+                    serde_json::to_string(&message).unwrap()
+                )))
+                .is_continue()
+            );
+        }
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .occluded = Some(true);
+        let _ = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+        });
+        assert_eq!(app.data[&market].events.records.len(), 2);
+        assert!(
+            app.data[&market]
+                .events
+                .records
+                .iter()
+                .any(|e| e.kind == events::Kind::Trade)
+        );
+        let events_id = app.workspaces[0]
+            .tiles
+            .iter()
+            .find_map(|(id, tile)| {
+                matches!(tile,Tile::Pane(p) if matches!(p.kind,WidgetKind::Events)).then_some(*id)
+            })
+            .unwrap();
+        app.close_widget(events_id);
+        assert!(
+            app.subscribed.contains(&market),
+            "the Imbalance widget still needs its book"
+        );
+        assert!(!app.data[&market].events.enabled);
+        assert!(app.data[&market].events.records.is_empty());
+    }
+
+    #[test]
+    fn orderflow_widget_layouts_restore_sources_and_independent_settings() {
+        for kind in [WidgetKind::Imbalance, WidgetKind::Events] {
+            let mut pane = Pane::new(kind, Market::default());
+            assert!(pane.uses_sources());
+            pane.series
+                .push(Market::for_exchange(Exchange::Hyperliquid));
+            pane.imbalance.levels = 20;
+            pane.imbalance.window_secs = 300;
+            pane.imbalance.units = orderflow::Units::Base;
+            pane.imbalance.weighting = imbalance::Weighting::Exponential;
+            pane.imbalance.half_life_bps = 3.5;
+            pane.events.window_secs = 600;
+            pane.events.types = [true, false, true, false];
+            let restored: Pane =
+                serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+            assert_eq!(restored.series, pane.series);
+            assert_eq!(restored.imbalance.levels, 20);
+            assert_eq!(restored.imbalance.units, orderflow::Units::Base);
+            assert_eq!(
+                restored.imbalance.weighting,
+                imbalance::Weighting::Exponential
+            );
+            assert_eq!(restored.imbalance.half_life_bps, 3.5);
+            assert_eq!(restored.events.types, [true, false, true, false]);
+            assert_eq!(restored.events.window_secs, 600);
+        }
+        let old: Pane =
+            serde_json::from_value(serde_json::json!({"kind":"Book","market":Market::default()}))
+                .unwrap();
+        assert_eq!(old.imbalance.levels, 10);
+        assert_eq!(old.imbalance.weighting, imbalance::Weighting::Flat);
+        assert_eq!(old.imbalance.half_life_bps, 2.0);
+        assert_eq!(old.events.types, [true; 4]);
+    }
 
     #[test]
     fn compact_accounts_keep_details_scrolling_and_removal_isolated() {
@@ -2853,6 +3204,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             market.exchange,
+            false,
         );
         assert_eq!(data.book.as_ref().unwrap().bids[0].price, "100");
         data.apply_book_delta(
@@ -2980,7 +3332,11 @@ mod tests {
         assert!(!json.contains("depth_quote"));
         assert!(!json.contains("quote_size"));
         let mut data = MarketData::default();
-        data.set_book(serde_json::from_str(&json).unwrap(), Exchange::Binance);
+        data.set_book(
+            serde_json::from_str(&json).unwrap(),
+            Exchange::Binance,
+            false,
+        );
         let book = data.book.unwrap();
         assert_eq!(book.bids.len(), 2);
         assert_eq!(book.bids[0].quote_size, "200.2");
@@ -3412,6 +3768,7 @@ mod tests {
                 updated_at_ms: 1_000,
             },
             Exchange::Binance,
+            false,
         );
         let quote = data.quotes.back().unwrap();
         assert_eq!((quote.bid, quote.ask), (100.1, 100.2));
@@ -3440,6 +3797,7 @@ mod tests {
                 updated_at_ms: 1,
             },
             Exchange::Binance,
+            false,
         );
         data.apply_book_delta(
             vec![
@@ -3493,6 +3851,7 @@ mod tests {
                 updated_at_ms: 1_050,
             },
             Exchange::Hyperliquid,
+            false,
         );
         let quote = data.best_bid_ask.as_ref().unwrap();
         assert_eq!((quote.bid.as_str(), quote.ask.as_str()), ("101", "102"));
@@ -3527,6 +3886,7 @@ mod tests {
                 updated_at_ms: 1_100,
             },
             Exchange::Gate,
+            false,
         );
         data.set_best_bid_ask(BestBidAsk {
             bid: "0.6205".into(),

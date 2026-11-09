@@ -33,7 +33,7 @@ fn trade_side_label(side: TradeSide) -> &'static str {
     }
 }
 
-fn venue_code(exchange: Exchange) -> &'static str {
+pub(super) fn venue_code(exchange: Exchange) -> &'static str {
     match exchange {
         Exchange::Binance => "BIN",
         Exchange::Okx => "OKX",

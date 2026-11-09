@@ -67,7 +67,11 @@ fn restore(app: &mut TerminalApp, undo: Undo) {
 
 fn sources(pane: &Pane) -> &[Market] {
     match pane.kind {
-        WidgetKind::Compare | WidgetKind::Tape | WidgetKind::Dom => &pane.series,
+        WidgetKind::Compare
+        | WidgetKind::Tape
+        | WidgetKind::Dom
+        | WidgetKind::Imbalance
+        | WidgetKind::Events => &pane.series,
         WidgetKind::Fills => &[], // An account-wide log keeps its explicit filters.
         _ => std::slice::from_ref(&pane.market),
     }
@@ -125,6 +129,7 @@ fn reset_views(pane: &mut Pane) {
     pane.dom_view = dom::View::default();
     pane.position_view = position::View::default();
     pane.compare_view = view::YAxisView::default();
+    pane.imbalance_view = crate::imbalance::View::default();
     pane.search.clear();
 }
 
@@ -195,8 +200,10 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
                 pane.orderflow.source = Some(next[index].clone());
             }
             pane.series = next;
-            if matches!(pane.kind, WidgetKind::Dom)
-                && let Some(first) = pane.series.first()
+            if matches!(
+                pane.kind,
+                WidgetKind::Dom | WidgetKind::Imbalance | WidgetKind::Events
+            ) && let Some(first) = pane.series.first()
             {
                 pane.market = first.clone();
             }
