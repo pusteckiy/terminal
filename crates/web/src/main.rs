@@ -9,6 +9,7 @@ mod imbalance;
 mod orderflow;
 mod position;
 mod private;
+mod slippage;
 mod socket;
 mod vault;
 mod view;
@@ -166,6 +167,7 @@ enum WidgetKind {
     Position,
     Imbalance,
     Events,
+    Slippage,
 }
 
 impl WidgetKind {
@@ -180,6 +182,7 @@ impl WidgetKind {
             Self::Position => "Position",
             Self::Imbalance => "Order Book Imbalance",
             Self::Events => "Market Events",
+            Self::Slippage => "Slippage",
         }
     }
 
@@ -194,6 +197,7 @@ impl WidgetKind {
             Self::Position => "POSITION",
             Self::Imbalance => "IMBALANCE",
             Self::Events => "EVENTS",
+            Self::Slippage => "SLIPPAGE",
         }
     }
 }
@@ -222,12 +226,15 @@ struct Pane {
     position: position::Settings,
     imbalance: imbalance::Settings,
     events: events::Settings,
+    slippage: slippage::Settings,
     unavailable_markets: Vec<Market>,
     batch_symbol: Option<String>,
     #[serde(skip)]
     position_view: position::View,
     #[serde(skip)]
     imbalance_view: imbalance::View,
+    #[serde(skip)]
+    slippage_view: slippage::View,
     #[serde(skip)]
     fills_view: fills::View,
     #[serde(skip)]
@@ -277,10 +284,12 @@ impl Pane {
             position: position::Settings::default(),
             imbalance: imbalance::Settings::default(),
             events: events::Settings::default(),
+            slippage: slippage::Settings::default(),
             unavailable_markets: Vec::new(),
             batch_symbol: None,
             position_view: position::View::default(),
             imbalance_view: imbalance::View::default(),
+            slippage_view: slippage::View::default(),
             fills_view: fills::View::default(),
             dom_view: dom::View::default(),
             chart: view::ChartView::default(),
@@ -357,6 +366,8 @@ impl<'de> Deserialize<'de> for Pane {
                 #[serde(default)]
                 events: events::Settings,
                 #[serde(default)]
+                slippage: slippage::Settings,
+                #[serde(default)]
                 unavailable_markets: Vec<Market>,
                 #[serde(default)]
                 batch_symbol: Option<String>,
@@ -380,6 +391,7 @@ impl<'de> Deserialize<'de> for Pane {
                 position,
                 imbalance,
                 events,
+                slippage,
                 unavailable_markets,
                 batch_symbol,
             } => {
@@ -416,6 +428,8 @@ impl<'de> Deserialize<'de> for Pane {
                 pane.imbalance.window_secs = pane.imbalance.window_secs.clamp(10, 600);
                 pane.events = events;
                 pane.events.window_secs = pane.events.window_secs.clamp(10, 600);
+                pane.slippage = slippage;
+                pane.slippage.sanitize();
                 pane.unavailable_markets = unavailable_markets;
                 pane.batch_symbol = batch_symbol;
                 pane
@@ -930,7 +944,7 @@ impl TerminalApp {
                 market: market.clone(),
             });
             self.data.remove(&market);
-            self.record_imbalance(Some(&market));
+            self.record_book_metrics(Some(&market));
         }
         for market in added {
             self.send(ClientMessage::Subscribe { market });
@@ -1017,24 +1031,38 @@ impl TerminalApp {
         }
     }
 
-    fn record_imbalance(&mut self, changed: Option<&Market>) {
+    fn record_book_metrics(&mut self, changed: Option<&Market>) {
         let now = utc_now_ms();
         for tree in &mut self.workspaces {
             for (_, tile) in tree.tiles.iter_mut() {
-                if let Tile::Pane(pane) = tile
-                    && matches!(pane.kind, WidgetKind::Imbalance)
-                {
-                    for market in &pane.series {
-                        if changed.is_none_or(|m| m == market)
-                            && !pane.unavailable_markets.contains(market)
+                if let Tile::Pane(pane) = tile {
+                    match pane.kind {
+                        WidgetKind::Imbalance => {
+                            for market in &pane.series {
+                                if changed.is_none_or(|m| m == market)
+                                    && !pane.unavailable_markets.contains(market)
+                                {
+                                    pane.imbalance_view.observe(
+                                        market,
+                                        &pane.imbalance,
+                                        self.data.get(market),
+                                        now,
+                                    );
+                                }
+                            }
+                        }
+                        WidgetKind::Slippage
+                            if changed.is_none_or(|m| m == &pane.market)
+                                && !pane.unavailable_markets.contains(&pane.market) =>
                         {
-                            pane.imbalance_view.observe(
-                                market,
-                                &pane.imbalance,
-                                self.data.get(market),
+                            pane.slippage_view.observe(
+                                &pane.market,
+                                &pane.slippage,
+                                self.data.get(&pane.market),
                                 now,
                             );
                         }
+                        _ => {}
                     }
                 }
             }
@@ -1210,7 +1238,7 @@ impl TerminalApp {
                         }
                         self.record_positions(Some(&market));
                         if book_changed {
-                            self.record_imbalance(Some(&market));
+                            self.record_book_metrics(Some(&market));
                         }
                     }
                 }
@@ -1244,7 +1272,7 @@ impl TerminalApp {
             data.fill_quotes = fills::QuoteHistory::default();
         }
         self.record_positions(None);
-        self.record_imbalance(None);
+        self.record_book_metrics(None);
         self.sender = None;
         self.receiver = None;
         self.reconnect_at = socket::now_ms() + 3_000;
@@ -1449,6 +1477,7 @@ impl TerminalApp {
                                 WidgetKind::Position,
                                 WidgetKind::Imbalance,
                                 WidgetKind::Events,
+                                WidgetKind::Slippage,
                             ] {
                                 if ui.button(kind.label()).clicked() {
                                     add = Some(kind);
@@ -2148,6 +2177,21 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                                         self.retry_catalogs,
                                     );
                                 }
+                                WidgetKind::Slippage => {
+                                    let quote = orderflow::symbol_info(&pane.market, self.catalogs)
+                                        .map_or("quote", |info| info.quote.as_str());
+                                    slippage::config_ui(ui, &mut pane.slippage, quote);
+                                    ui.separator();
+                                    market_editor(
+                                        ui,
+                                        &mut pane.market,
+                                        &mut pane.search,
+                                        self.catalogs,
+                                        self.catalog_errors,
+                                        self.needed_catalogs,
+                                        self.retry_catalogs,
+                                    );
+                                }
                                 WidgetKind::Chart | WidgetKind::Book => market_editor(
                                     ui,
                                     &mut pane.market,
@@ -2182,6 +2226,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             pane.book_view = view::BookView::default();
             pane.dom_view = dom::View::default();
             pane.position_view = position::View::default();
+            pane.slippage_view = slippage::View::default();
         }
         if old_compare.0 != pane.series
             || old_compare.1 != pane.compare_mode
@@ -2345,6 +2390,17 @@ impl Behavior<Pane> for PaneBehavior<'_> {
                 self.needed_catalogs
                     .extend(sources.iter().map(|m| (m.exchange, m.kind)));
                 events::ui(ui, sources, self.data, self.catalogs, &mut pane.events);
+            }
+            WidgetKind::Slippage => {
+                self.needed_catalogs.insert((market.exchange, market.kind));
+                slippage::ui(
+                    ui,
+                    market,
+                    data,
+                    orderflow::symbol_info(market, self.catalogs),
+                    &mut pane.slippage,
+                    &mut pane.slippage_view,
+                );
             }
             WidgetKind::Position => {
                 self.needed_catalogs
@@ -2820,6 +2876,64 @@ mod tests {
         assert_eq!(old.imbalance.weighting, imbalance::Weighting::Flat);
         assert_eq!(old.imbalance.half_life_bps, 2.0);
         assert_eq!(old.events.types, [true; 4]);
+    }
+
+    #[test]
+    fn slippage_settings_restore_and_history_records_without_painting() {
+        let market = Market::default();
+        let mut pane = Pane::new(WidgetKind::Slippage, market.clone());
+        pane.slippage.capitals = vec!["100.25".into(), "200".into()];
+        pane.slippage.selected = 1;
+        pane.slippage.show_values = false;
+        pane.slippage.window_secs = 600;
+        let restored: Pane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(restored.slippage.capitals, pane.slippage.capitals);
+        assert!(!restored.slippage.show_values);
+        assert_eq!(restored.slippage.selected, 1);
+        assert_eq!(restored.slippage.window_secs, 600);
+        assert_eq!(restored.slippage_view.sample_count(), 0);
+        let mut app = test_app();
+        app.workspaces = vec![Tree::new_horizontal("slippage", vec![restored])];
+        app.socket_open = true;
+        app.sync_subscriptions();
+        assert!(app.subscribed.contains(&market));
+        let (receiver, on_event) = socket::channel(|| {});
+        app.receiver = Some(receiver);
+        let level = |price: &str| Level {
+            price: price.into(),
+            size: "10".into(),
+            quote_size: String::new(),
+            depth_base: String::new(),
+            depth_quote: String::new(),
+        };
+        let message = ServerMessage::Book {
+            market: market.clone(),
+            book: Book {
+                bids: vec![level("100")],
+                asks: vec![level("101")],
+                updated_at_ms: utc_now_ms(),
+            },
+        };
+        assert!(
+            on_event(WsEvent::Message(WsMessage::Text(
+                serde_json::to_string(&message).unwrap(),
+            )))
+            .is_continue()
+        );
+        app.poll_socket(&egui::Context::default());
+        let pane = app.workspaces[0]
+            .tiles
+            .iter()
+            .find_map(|(_, t)| if let Tile::Pane(p) = t { Some(p) } else { None })
+            .unwrap();
+        assert!(
+            pane.slippage_view.sample_count() > 0,
+            "socket book updates record history without a UI paint"
+        );
+        let old: Pane =
+            serde_json::from_value(serde_json::json!({"kind":"Book","market":market})).unwrap();
+        assert!(old.slippage.show_values);
+        assert_eq!(old.slippage.capitals.len(), 4);
     }
 
     #[test]

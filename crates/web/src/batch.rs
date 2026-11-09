@@ -130,6 +130,7 @@ fn reset_views(pane: &mut Pane) {
     pane.position_view = position::View::default();
     pane.compare_view = view::YAxisView::default();
     pane.imbalance_view = crate::imbalance::View::default();
+    pane.slippage_view = crate::slippage::View::default();
     pane.search.clear();
 }
 
