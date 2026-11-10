@@ -17,10 +17,11 @@ pub enum Exchange {
     Kucoin,
     Kraken,
     Pacifica,
+    Coinbase,
 }
 
 impl Exchange {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Binance,
         Self::Okx,
         Self::Bybit,
@@ -33,6 +34,7 @@ impl Exchange {
         Self::Kucoin,
         Self::Kraken,
         Self::Pacifica,
+        Self::Coinbase,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -49,7 +51,12 @@ impl Exchange {
             Self::Kucoin => "KuCoin",
             Self::Kraken => "Kraken",
             Self::Pacifica => "Pacifica",
+            Self::Coinbase => "Coinbase",
         }
+    }
+
+    pub const fn supports(self, kind: MarketKind) -> bool {
+        !matches!((self, kind), (Self::Coinbase, MarketKind::Perp))
     }
 
     pub const fn default_symbol(self, kind: MarketKind) -> &'static str {
@@ -70,6 +77,7 @@ impl Exchange {
             (Self::Kraken, MarketKind::Perp) => "PF_XBTUSD",
             (Self::Pacifica, MarketKind::Spot) => "SOL-USDC",
             (Self::Pacifica, MarketKind::Perp) => "BTC",
+            (Self::Coinbase, _) => "BTC-USD",
         }
     }
 }
@@ -176,6 +184,7 @@ impl<'de> Deserialize<'de> for Market {
                 (Exchange::Kraken, true) => "ETH/USD",
                 (Exchange::Pacifica, true) if kind == MarketKind::Spot => "SOL-USDC",
                 (Exchange::Pacifica, true) => "ETH",
+                (Exchange::Coinbase, true) => "ETH-USD",
                 (exchange, false) => exchange.default_symbol(kind),
             }
             .to_owned()
@@ -641,6 +650,25 @@ mod tests {
                 ..account
             }
             .valid()
+        );
+    }
+
+    #[test]
+    fn coinbase_spot_markets_restore_without_enabling_unsupported_perps() {
+        assert!(Exchange::Coinbase.supports(MarketKind::Spot));
+        assert!(!Exchange::Coinbase.supports(MarketKind::Perp));
+        let market = Market::for_exchange(Exchange::Coinbase);
+        assert_eq!(market.kind, MarketKind::Spot);
+        assert_eq!(market.symbol, "BTC-USD");
+        let restored: Market =
+            serde_json::from_str(&serde_json::to_string(&market).unwrap()).unwrap();
+        assert_eq!(restored, market);
+        assert_eq!(
+            Exchange::ALL
+                .iter()
+                .filter(|exchange| **exchange == Exchange::Coinbase)
+                .count(),
+            1
         );
     }
 

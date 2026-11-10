@@ -1,4 +1,4 @@
-//! One-shot symbol changes scoped to a terminal, resolved against venue catalogs.
+//! One-shot market changes scoped to a terminal, resolved against venue catalogs.
 use crate::*;
 
 pub struct Dialog {
@@ -6,7 +6,10 @@ pub struct Dialog {
     query: String,
     selected: Option<String>,
     choices: HashMap<Market, Market>,
+    exchange: Option<Exchange>,
+    kind: Option<MarketKind>,
     focus: bool,
+    preview: bool,
 }
 
 impl Dialog {
@@ -16,7 +19,10 @@ impl Dialog {
             query: String::new(),
             selected: None,
             choices: HashMap::new(),
+            exchange: None,
+            kind: None,
             focus: true,
+            preview: false,
         }
     }
 
@@ -28,11 +34,85 @@ impl Dialog {
                 options.iter().find(|option| {
                     from.exchange == Exchange::Hyperliquid
                         && from.kind == MarketKind::Perp
+                        && option.exchange == from.exchange
+                        && option.kind == from.kind
                         && dex(&option.symbol) == dex(&from.symbol)
                 })
             })
             .or_else(|| options.first().filter(|_| options.len() == 1))
             .cloned()
+    }
+
+    fn target(&self, from: &Market) -> (Exchange, MarketKind) {
+        (
+            self.exchange.unwrap_or(from.exchange),
+            self.kind.unwrap_or(from.kind),
+        )
+    }
+
+    fn catalog_keys(&self, from: &[Market]) -> HashSet<(Exchange, MarketKind)> {
+        from.iter()
+            .flat_map(|market| [(market.exchange, market.kind), self.target(market)])
+            .filter(|(exchange, kind)| exchange.supports(*kind))
+            .collect()
+    }
+
+    fn options(
+        &self,
+        from: &Market,
+        base: Option<&str>,
+        catalogs: &HashMap<(Exchange, MarketKind), Vec<SymbolInfo>>,
+    ) -> Vec<Market> {
+        let (exchange, kind) = self.target(from);
+        if !exchange.supports(kind) {
+            return Vec::new();
+        }
+        let Some(catalog) = catalogs.get(&(exchange, kind)) else {
+            return Vec::new();
+        };
+        let original = catalogs
+            .get(&(from.exchange, from.kind))
+            .and_then(|rows| rows.iter().find(|info| info.symbol == from.symbol));
+        if (exchange, kind) == (from.exchange, from.kind) {
+            return if let Some(base) = base {
+                candidates(from, base, catalog)
+            } else {
+                catalog
+                    .iter()
+                    .any(|info| info.symbol == from.symbol)
+                    .then(|| from.clone())
+                    .into_iter()
+                    .collect()
+            };
+        }
+        let Some(base) =
+            base.or_else(|| original.map(|info| orderflow::base_units(&info.base, from.kind).0))
+        else {
+            return Vec::new();
+        };
+        let rows: Vec<_> = catalog
+            .iter()
+            .filter(|info| {
+                orderflow::base_units(&info.base, kind)
+                    .0
+                    .eq_ignore_ascii_case(base)
+            })
+            .collect();
+        let same_quote = original.is_some_and(|old| {
+            rows.iter()
+                .any(|info| info.quote.eq_ignore_ascii_case(&old.quote))
+        });
+        rows.into_iter()
+            .filter(|info| {
+                !same_quote
+                    || original.is_some_and(|old| info.quote.eq_ignore_ascii_case(&old.quote))
+            })
+            .map(|info| Market {
+                exchange,
+                kind,
+                symbol: info.symbol.clone(),
+            })
+            .collect()
     }
 }
 
@@ -154,7 +234,7 @@ fn coin_list(
         })
 }
 
-fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize {
+fn apply(app: &mut TerminalApp, dialog: &Dialog, base: Option<&str>, now: f64) -> usize {
     let tree = &mut app.workspaces[dialog.workspace];
     let mut previous = Vec::new();
     for (id, tile) in tree.tiles.iter_mut() {
@@ -172,18 +252,14 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
         });
         let old = sources(pane).to_vec();
         pane.unavailable_markets.clear();
-        pane.batch_symbol = Some(base.to_owned());
+        pane.batch_symbol = base.map(str::to_owned);
         let next: Vec<_> = old
             .iter()
             .map(|from| {
-                let options = app
-                    .catalogs
-                    .get(&(from.exchange, from.kind))
-                    .map(|catalog| candidates(from, base, catalog))
-                    .unwrap_or_default();
+                let options = dialog.options(from, base, &app.catalogs);
                 let resolved = dialog.choice(from, &options);
                 resolved.unwrap_or_else(|| {
-                    // Retain the venue/quote/DEX identity for a later batch change.
+                    // Retain the original identity for recovery or Undo.
                     // This market is explicitly blocked from rendering/subscription.
                     let missing = from.clone();
                     pane.unavailable_markets.push(missing.clone());
@@ -201,11 +277,10 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
                 pane.orderflow.source = Some(next[index].clone());
             }
             pane.series = next;
-            if matches!(
-                pane.kind,
-                WidgetKind::Dom | WidgetKind::Imbalance | WidgetKind::Events
-            ) && let Some(first) = pane.series.first()
-            {
+            let mut unique = HashSet::new();
+            pane.series.retain(|market| unique.insert(market.clone()));
+            pane.editing_series = pane.editing_series.min(pane.series.len() - 1);
+            if let Some(first) = pane.series.first() {
                 pane.market = first.clone();
             }
         } else {
@@ -216,7 +291,7 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
     let count = previous.len();
     app.batch_undo = Some(Undo {
         workspace: dialog.workspace,
-        symbol: base.to_owned(),
+        symbol: base.unwrap_or("Markets").to_owned(),
         panes: previous,
         expires: now + 10.0,
     });
@@ -226,92 +301,150 @@ fn apply(app: &mut TerminalApp, dialog: &Dialog, base: &str, now: f64) -> usize 
 pub fn ui(app: &mut TerminalApp, ctx: &egui::Context) {
     if let Some(mut dialog) = app.batch_change.take() {
         let from = markets(&app.workspaces[dialog.workspace]);
-        let keys: HashSet<_> = from
-            .iter()
-            .map(|market| (market.exchange, market.kind))
-            .collect();
-        app.request_catalogs(keys.clone(), HashSet::new());
-        let ready = keys.iter().all(|key| app.catalogs.contains_key(key));
-        let preview_was_shown = dialog.selected.is_some();
+        let preview_was_shown = dialog.selected.is_some() || dialog.query.trim().is_empty();
         let mut open = true;
         let mut do_apply = false;
         let mut cancel = false;
-        egui::Window::new(format!("Change symbol · Terminal {}", dialog.workspace + 1))
+        let count = app.workspaces[dialog.workspace]
+            .tiles
+            .iter()
+            .filter(|(_, tile)| matches!(tile, Tile::Pane(pane) if !sources(pane).is_empty()))
+            .count();
+        egui::Window::new("Change markets")
             .id(egui::Id::new("batch-symbol"))
-            .open(&mut open).collapsible(false).resizable(false)
-            .default_width(380.0).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .title_bar(false).resizable(false)
+            .frame(egui::Frame::window(&ctx.global_style()).inner_margin(16))
+            .default_width(420.0).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(RichText::new("Keep each widget’s exchange and market type.").size(11.0).color(MUTED));
-                let search = ui.add(egui::TextEdit::singleline(&mut dialog.query).hint_text("Search coin, e.g. BTC").desired_width(f32::INFINITY));
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Change markets").size(16.0));
+                        ui.label(RichText::new(format!("Terminal {} · {count} widgets", dialog.workspace + 1)).size(12.0).color(MUTED));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_sized([26.0, 26.0], egui::Button::new(RichText::new("×").size(18.0)).frame(false)).on_hover_text("Close").clicked() { open = false; }
+                    });
+                });
+                ui.add_space(2.0);
+                let previous=(dialog.exchange,dialog.kind);
+                ui.columns(2, |columns| {
+                    for column in columns.iter_mut() {
+                        column.spacing_mut().interact_size.y = 30.0;
+                        column.spacing_mut().item_spacing.y = 6.0;
+                    }
+                    columns[0].label(RichText::new("Exchange").size(12.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("batch-exchange").width(columns[0].available_width()).height(240.0).selected_text(dialog.exchange.map_or("Keep current",Exchange::label)).show_ui(&mut columns[0],|ui| {
+                        ui.selectable_value(&mut dialog.exchange,None,"Keep current");
+                        for exchange in Exchange::ALL { ui.selectable_value(&mut dialog.exchange,Some(exchange),exchange.label()); }
+                    });
+                    if previous.0!=dialog.exchange && let Some(exchange)=dialog.exchange
+                        && from.iter().any(|market|!exchange.supports(dialog.kind.unwrap_or(market.kind))) {
+                        dialog.kind=Some(MarketKind::Spot);
+                    }
+                    columns[1].label(RichText::new("Market").size(12.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("batch-kind").width(columns[1].available_width()).selected_text(dialog.kind.map_or("Keep current",MarketKind::label)).show_ui(&mut columns[1],|ui| {
+                        ui.selectable_value(&mut dialog.kind,None,"Keep current");
+                        for kind in MarketKind::ALL {
+                            ui.add_enabled_ui(dialog.exchange.is_none_or(|exchange|exchange.supports(kind)),|ui|ui.selectable_value(&mut dialog.kind,Some(kind),kind.label()));
+                        }
+                    });
+                });
+                if previous!=(dialog.exchange,dialog.kind) { dialog.choices.clear(); }
+                ui.label(RichText::new("Symbol").size(12.0).color(MUTED));
+                let search = ui.add_sized([ui.available_width(), 30.0], egui::TextEdit::singleline(&mut dialog.query).hint_text("Keep current, or search coin").vertical_align(egui::Align::Center));
                 if dialog.focus { search.request_focus(); dialog.focus = false; }
                 if search.changed() { dialog.selected = None; dialog.choices.clear(); }
+                let search_enter=(search.has_focus() || search.lost_focus()) && ui.input(|input|input.key_pressed(egui::Key::Enter));
+                let keys=dialog.catalog_keys(&from);
+                app.request_catalogs(keys.clone(), HashSet::new());
+                let ready=keys.iter().all(|key|app.catalogs.contains_key(key));
                 if !ready {
                     for key in &keys {
                         if let Some(error) = app.catalog_errors.get(key) {
-                            ui.label(RichText::new(format!("{} {}: {error}", key.0.label(), key.1.label())).small().color(RED));
+                            ui.label(RichText::new(format!("{} {}: {error}", key.0.label(), key.1.label())).size(12.0).color(RED));
                             if ui.small_button("Retry").clicked() { app.request_catalogs(HashSet::from([*key]), HashSet::from([*key])); }
                         }
                     }
-                    ui.label(RichText::new("Loading market catalogs…").small().color(MUTED));
+                    ui.label(RichText::new("Loading market catalogs…").size(12.0).color(MUTED));
                 }
                 let query = dialog.query.trim().to_ascii_uppercase();
-                if dialog.selected.is_none() && ready {
-                    let mut bases: Vec<_> = from.iter().flat_map(|market| app.catalogs.get(&(market.exchange, market.kind)).into_iter().flatten()
-                        .map(move |info| orderflow::base_units(&info.base, market.kind).0.to_ascii_uppercase())).filter(|base| query.is_empty() || base.contains(&query)).collect();
+                if dialog.selected.is_none() && !query.is_empty() && ready {
+                    let mut bases: Vec<_> = from.iter().flat_map(|market| {
+                        let key=dialog.target(market);
+                        app.catalogs.get(&key).into_iter().flatten().map(move |info|orderflow::base_units(&info.base,key.1).0.to_ascii_uppercase())
+                    }).filter(|base|base.contains(&query)).collect();
                     bases.sort_unstable(); bases.dedup();
                     if bases.is_empty() { ui.label(RichText::new("No matching symbols").color(MUTED)); }
-                    let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    if enter && bases.contains(&query) {
-                        dialog.selected = Some(query.clone()); dialog.query = query.clone();
+                    if search_enter && bases.contains(&query) {
+                        dialog.selected = Some(query.clone()); dialog.query = query.clone(); search.request_focus();
                     }
                     if let Some(base) = coin_list(ui, &bases).inner {
                         dialog.selected = Some(base.clone()); dialog.query = base;
                     }
                 }
-                if let Some(base) = dialog.selected.clone() {
-                    ui.separator();
-                    let mut unresolved = false;
-                    let mut missing = 0;
-                    egui::ScrollArea::vertical().id_salt("batch-preview").max_height(220.0).show(ui, |ui| {
-                        for market in &from {
-                            let options = app.catalogs.get(&(market.exchange, market.kind)).map(|catalog| candidates(market, &base, catalog)).unwrap_or_default();
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{} {}", market.exchange.label(), market.kind.label())).size(12.0).color(MUTED));
-                                if options.is_empty() {
-                                    missing += 1;
-                                    ui.label(RichText::new("Unavailable · paused").size(12.0).color(RED));
-                                } else if options.len() == 1 {
-                                    ui.label(RichText::new(&options[0].symbol).monospace().size(12.0));
-                                } else {
-                                    let choice = dialog.choice(market, &options);
-                                    unresolved |= choice.is_none();
-                                    egui::menu::MenuButton::new(choice.as_ref().map_or("Choose market…", |market| &market.symbol)).ui(ui, |ui| {
-                                        for option in options { if ui.button(&option.symbol).clicked() { dialog.choices.insert(market.clone(), option); ui.close(); } }
-                                    });
-                                }
-                            });
-                        }
+                ui.separator();
+                let current = if from.len() == 1 {
+                    let market = &from[0];
+                    format!("{} {} {}", market.exchange.label(), market.kind.label(), market.symbol)
+                } else { format!("{} markets", from.len()) };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Current").size(12.0).color(MUTED));
+                    ui.add(egui::Label::new(RichText::new(current).size(12.0)).truncate());
+                });
+                let mut enabled = false;
+                if ready && (dialog.selected.is_some() || query.is_empty()) {
+                    let base=dialog.selected.clone();
+                    let options: Vec<_> = from.iter().map(|market| dialog.options(market,base.as_deref(),&app.catalogs)).collect();
+                    let unresolved = from.iter().zip(&options).any(|(market, options)| !options.is_empty() && dialog.choice(market, options).is_none());
+                    let missing = options.iter().filter(|options| options.is_empty()).count();
+                    // Required market choices must stay visible even when the preview is collapsed.
+                    if unresolved { dialog.preview = true; }
+                    let preview = egui::CollapsingHeader::new(RichText::new(format!("Preview changes · {count} widgets")).size(12.0).color(MUTED))
+                        .id_salt("batch-preview-header").open(Some(dialog.preview)).show(ui, |ui| {
+                        egui::ScrollArea::vertical().id_salt("batch-preview").auto_shrink([false, true]).max_height(200.0).show(ui, |ui| {
+                            for (market, options) in from.iter().zip(&options) {
+                                let target=dialog.target(market);
+                                ui.add(egui::Label::new(RichText::new(format!("{} {} {}",market.exchange.label(),market.kind.label(),market.symbol)).size(12.0).color(MUTED)).truncate());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(format!("To {} {}", target.0.label(), target.1.label())).size(12.0).color(MUTED));
+                                    if options.is_empty() {
+                                        ui.label(RichText::new("Unavailable · paused").size(12.0).color(RED));
+                                    } else if options.len() == 1 {
+                                        ui.label(RichText::new(&options[0].symbol).monospace().size(12.0));
+                                    } else {
+                                        let choice = dialog.choice(market, options);
+                                        egui::menu::MenuButton::new(choice.as_ref().map_or("Choose market…", |market| &market.symbol)).ui(ui, |ui| {
+                                            for option in options { if ui.button(&option.symbol).clicked() { dialog.choices.insert(market.clone(), option.clone()); ui.close(); } }
+                                        });
+                                    }
+                                });
+                            }
+                        });
                     });
-                    if missing > 0 { ui.label(RichText::new("Unavailable sources pause; no old symbol is shown.").small().color(MUTED)); }
-                    let count = app.workspaces[dialog.workspace].tiles.iter().filter(|(_, tile)| matches!(tile, Tile::Pane(pane) if !sources(pane).is_empty())).count();
-                    let enabled = ready && !unresolved && count > 0 && missing < from.len();
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        do_apply = ui.add_enabled(enabled, egui::Button::new(RichText::new(format!("Apply to {count} widgets")).color(BG)).fill(TEXT)).clicked()
-                            || (enabled && preview_was_shown && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                        if ui.button("Cancel").clicked() { cancel = true; }
+                    if preview.header_response.clicked() { dialog.preview = !dialog.preview; }
+                    if missing > 0 { ui.label(RichText::new(format!("{missing} unavailable sources will pause.")).size(12.0).color(RED)); }
+                    let changed=dialog.selected.is_some() || dialog.exchange.is_some() || dialog.kind.is_some();
+                    enabled = changed && !unresolved && count > 0 && missing < from.len();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if enabled { format!("{count} widgets will change") } else { "No changes ready".to_owned() }).size(12.0).color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        do_apply = ui.add_enabled(enabled, egui::Button::new(RichText::new("Apply changes").color(BG)).fill(TEXT).min_size(egui::vec2(110.0, 30.0))).clicked()
+                            || (enabled && preview_was_shown && search_enter);
+                        if ui.add_sized([60.0, 30.0], egui::Button::new("Cancel").frame(false)).clicked() { cancel = true; }
                     });
-                    if app.workspaces[dialog.workspace].tiles.iter().any(|(_, tile)| matches!(tile, Tile::Pane(pane) if matches!(pane.kind, WidgetKind::Fills))) {
-                        ui.label(RichText::new("FILLS keeps its account filters.").small().color(MUTED));
-                    }
+                });
+                if app.workspaces[dialog.workspace].tiles.iter().any(|(_, tile)| matches!(tile, Tile::Pane(pane) if matches!(pane.kind, WidgetKind::Fills))) {
+                    ui.label(RichText::new("FILLS keeps its account filters.").size(12.0).color(MUTED));
                 }
             });
         if do_apply {
             apply(
                 app,
                 &dialog,
-                dialog.selected.as_ref().unwrap(),
+                dialog.selected.as_deref(),
                 ctx.input(|input| input.time),
             );
         } else if open && !cancel && !ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -367,6 +500,310 @@ mod tests {
     }
 
     #[test]
+    fn venue_kind_and_symbol_update_all_market_widgets_and_merge_duplicate_sources() {
+        let mut app = crate::tests::test_app();
+        let binance = Market::default();
+        let bybit = market(Exchange::Bybit, "BTCUSDT");
+        let chosen = Market {
+            exchange: Exchange::Coinbase,
+            kind: MarketKind::Spot,
+            symbol: "ETH-USD".into(),
+        };
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        app.catalogs.insert(
+            (Exchange::Bybit, MarketKind::Perp),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        app.catalogs.insert(
+            (Exchange::Coinbase, MarketKind::Spot),
+            vec![info("ETH-USD", "ETH", "USD"), info("ETH-EUR", "ETH", "EUR")],
+        );
+        let kinds = [
+            WidgetKind::Chart,
+            WidgetKind::Book,
+            WidgetKind::Compare,
+            WidgetKind::Tape,
+            WidgetKind::Dom,
+            WidgetKind::Position,
+            WidgetKind::Imbalance,
+            WidgetKind::Events,
+            WidgetKind::Slippage,
+            WidgetKind::Fills,
+        ];
+        let panes = kinds.map(|kind| {
+            let mut pane = Pane::new(kind, binance.clone());
+            if pane.uses_sources() {
+                pane.series = vec![binance.clone(), bybit.clone()];
+                pane.orderflow.source = Some(bybit.clone());
+                pane.editing_series = 1;
+            }
+            pane.slippage.show_values = false;
+            pane
+        });
+        app.workspaces[0] = Tree::new_horizontal("all-market-widgets", panes.into());
+        let before = serde_json::to_string(&app.workspaces).unwrap();
+        let other = serde_json::to_string(&app.workspaces[1]).unwrap();
+        let mut dialog = Dialog::new(0);
+        dialog.exchange = Some(Exchange::Coinbase);
+        dialog.kind = Some(MarketKind::Spot);
+        dialog.choices.insert(binance, chosen.clone());
+        dialog.choices.insert(bybit, chosen.clone());
+        assert_eq!(apply(&mut app, &dialog, Some("ETH"), 0.0), 9);
+        for (_, tile) in app.workspaces[0].tiles.iter() {
+            let Tile::Pane(pane) = tile else { continue };
+            if matches!(pane.kind, WidgetKind::Fills) {
+                assert_eq!(pane.market.exchange, Exchange::Binance);
+                continue;
+            }
+            assert_eq!(pane.market, chosen);
+            assert!(!pane.slippage.show_values);
+            assert!(pane.unavailable_markets.is_empty());
+            if pane.uses_sources() {
+                assert_eq!(pane.series, [chosen.clone()]);
+                assert_eq!(pane.editing_series, 0);
+                assert_eq!(pane.orderflow.source, Some(chosen.clone()));
+            }
+        }
+        assert_eq!(serde_json::to_string(&app.workspaces[1]).unwrap(), other);
+        app.socket_open = true;
+        app.sync_subscriptions();
+        assert_eq!(app.subscribed, HashSet::from([chosen]));
+        let saved = serde_json::to_string(&app.workspaces[0]).unwrap();
+        let restored: Tree<Pane> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&saved).unwrap()
+        );
+        let undo = app.batch_undo.take().unwrap();
+        restore(&mut app, undo);
+        assert_eq!(serde_json::to_string(&app.workspaces).unwrap(), before);
+    }
+
+    #[test]
+    fn changing_only_venue_preserves_each_underlying_coin_and_resolves_new_quote() {
+        let btc = Market::default();
+        let eth = Market {
+            symbol: "ETHUSDT".into(),
+            ..btc.clone()
+        };
+        let mut app = crate::tests::test_app();
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![
+                info("BTCUSDT", "BTC", "USDT"),
+                info("ETHUSDT", "ETH", "USDT"),
+            ],
+        );
+        app.catalogs.insert(
+            (Exchange::Coinbase, MarketKind::Spot),
+            vec![info("BTC-USD", "BTC", "USD"), info("ETH-USD", "ETH", "USD")],
+        );
+        app.workspaces[0] = Tree::new_horizontal(
+            "keep-coins",
+            vec![
+                Pane::new(WidgetKind::Chart, btc),
+                Pane::new(WidgetKind::Book, eth),
+            ],
+        );
+        let mut dialog = Dialog::new(0);
+        dialog.exchange = Some(Exchange::Coinbase);
+        assert_eq!(apply(&mut app, &dialog, None, 0.0), 2);
+        let result = markets(&app.workspaces[0]);
+        assert!(
+            result
+                .iter()
+                .all(|m| m.exchange == Exchange::Coinbase && m.kind == MarketKind::Spot)
+        );
+        assert_eq!(
+            result.iter().map(|m| m.symbol.as_str()).collect::<Vec<_>>(),
+            ["BTC-USD", "ETH-USD"]
+        );
+    }
+
+    #[test]
+    fn market_type_only_preserves_venue_and_resolves_native_contracts() {
+        let mut app = crate::tests::test_app();
+        let from = Market::default();
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Perp),
+            vec![
+                info("BTCUSDT", "BTC", "USDT"),
+                info("BTCUSDC", "BTC", "USDC"),
+            ],
+        );
+        let mut dialog = Dialog::new(0);
+        dialog.kind = Some(MarketKind::Perp);
+        let options = dialog.options(&from, None, &app.catalogs);
+        assert_eq!(options, [market(Exchange::Binance, "BTCUSDT")]);
+        assert!(
+            dialog
+                .catalog_keys(&[from.clone()])
+                .contains(&(Exchange::Binance, MarketKind::Perp))
+        );
+        let mut unsupported = Dialog::new(0);
+        unsupported.exchange = Some(Exchange::Coinbase);
+        unsupported.kind = Some(MarketKind::Perp);
+        assert!(
+            unsupported
+                .options(&from, Some("ETH"), &app.catalogs)
+                .is_empty()
+        );
+        assert!(
+            !unsupported
+                .catalog_keys(&[from])
+                .contains(&(Exchange::Coinbase, MarketKind::Perp))
+        );
+    }
+
+    #[test]
+    fn target_quote_ambiguity_requires_a_choice_and_cannot_reuse_stale_choices() {
+        let from = Market::default();
+        let mut catalogs = HashMap::new();
+        catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        catalogs.insert(
+            (Exchange::Coinbase, MarketKind::Spot),
+            vec![info("ETH-USD", "ETH", "USD"), info("ETH-EUR", "ETH", "EUR")],
+        );
+        let mut dialog = Dialog::new(0);
+        dialog.exchange = Some(Exchange::Coinbase);
+        let options = dialog.options(&from, Some("ETH"), &catalogs);
+        assert_eq!(options.len(), 2);
+        assert!(dialog.choice(&from, &options).is_none());
+        dialog.choices.insert(from.clone(), options[1].clone());
+        assert_eq!(dialog.choice(&from, &options), Some(options[1].clone()));
+        dialog.exchange = None;
+        assert!(
+            dialog
+                .choice(&from, &dialog.options(&from, Some("ETH"), &catalogs))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_preview_starts_closed_but_reveals_required_market_choices() {
+        let mut app = crate::tests::test_app();
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        app.catalogs.insert(
+            (Exchange::Coinbase, MarketKind::Spot),
+            vec![info("ETH-USD", "ETH", "USD"), info("ETH-EUR", "ETH", "EUR")],
+        );
+        let mut dialog = Dialog::new(0);
+        assert!(!dialog.preview);
+        dialog.exchange = Some(Exchange::Coinbase);
+        dialog.query = "ETH".into();
+        dialog.selected = Some("ETH".into());
+        app.batch_change = Some(dialog);
+        let ctx = egui::Context::default();
+        for frame in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    events: if frame == 0 {
+                        vec![]
+                    } else {
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }]
+                    },
+                    ..Default::default()
+                },
+                |ui| super::ui(&mut app, ui.ctx()),
+            );
+            output.textures_delta.clear();
+            assert!(app.batch_change.as_ref().unwrap().preview);
+            assert!(
+                app.batch_undo.is_none(),
+                "an unresolved quote choice must block Apply even with Enter"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_previews_then_applies_the_selected_market_without_skipping_confirmation() {
+        let mut app = crate::tests::test_app();
+        app.catalogs.insert(
+            (Exchange::Binance, MarketKind::Spot),
+            vec![info("BTCUSDT", "BTC", "USDT")],
+        );
+        app.catalogs.insert(
+            (Exchange::Coinbase, MarketKind::Spot),
+            vec![info("ETH-USD", "ETH", "USD")],
+        );
+        let mut dialog = Dialog::new(0);
+        dialog.exchange = Some(Exchange::Coinbase);
+        dialog.kind = Some(MarketKind::Spot);
+        app.batch_change = Some(dialog);
+        let ctx = egui::Context::default();
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for (frame, events) in [
+            vec![],
+            vec![egui::Event::Text("ETH".into())],
+            vec![enter()],
+            vec![enter()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| super::ui(&mut app, ui.ctx()),
+            );
+            output.textures_delta.clear();
+            if frame == 2 {
+                assert_eq!(
+                    app.batch_change.as_ref().unwrap().selected.as_deref(),
+                    Some("ETH")
+                );
+                assert!(
+                    markets(&app.workspaces[0])
+                        .iter()
+                        .all(|m| m.exchange == Exchange::Binance),
+                    "first Enter only opens preview"
+                );
+            }
+        }
+        assert!(app.batch_change.is_none());
+        assert!(
+            markets(&app.workspaces[0])
+                .iter()
+                .all(|m| m.exchange == Exchange::Coinbase && m.symbol == "ETH-USD")
+        );
+    }
+
+    #[test]
     fn batch_changes_every_dom_source_resolves_bundles_and_undo_restores() {
         let mut app = crate::tests::test_app();
         let binance = market(Exchange::Binance, "BTCUSDT");
@@ -388,7 +825,7 @@ mod tests {
         let id = tiles.insert_pane(pane);
         app.workspaces[0] = Tree::new("multi-dom", id, tiles);
         let before = serde_json::to_string(&app.workspaces).unwrap();
-        assert_eq!(apply(&mut app, &Dialog::new(0), "PEPE", 0.0), 1);
+        assert_eq!(apply(&mut app, &Dialog::new(0), Some("PEPE"), 0.0), 1);
         let pane = app.workspaces[0].tiles.get_pane(&id).unwrap();
         assert_eq!(
             pane.series
@@ -468,7 +905,7 @@ mod tests {
         app.workspaces[0] = Tree::new("repeat-dex", pane, tiles);
         let mut first = Dialog::new(0);
         first.choices.insert(native, xyz.clone());
-        apply(&mut app, &first, "UNITREE", 0.0);
+        apply(&mut app, &first, Some("UNITREE"), 0.0);
         let current = app.workspaces[0]
             .tiles
             .get_pane(&pane)
@@ -486,7 +923,7 @@ mod tests {
         assert_eq!(second.choice(&current, &options), Some(xyz.clone()));
         second.choices.insert(current.clone(), para.clone());
         assert_eq!(second.choice(&current, &options), Some(para.clone()));
-        apply(&mut app, &second, "UNITREE", 1.0);
+        apply(&mut app, &second, Some("UNITREE"), 1.0);
         let updated = app.workspaces[0].tiles.get_pane(&pane).unwrap();
         assert_eq!(updated.market, para);
         assert!(updated.unavailable_markets.is_empty());
@@ -542,7 +979,7 @@ mod tests {
         let before = serde_json::to_string(&app.workspaces).unwrap();
         let mut dialog = Dialog::new(0);
         dialog.choices.insert(from.clone(), chosen.clone());
-        assert_eq!(apply(&mut app, &dialog, "UNITREE", 0.0), 2);
+        assert_eq!(apply(&mut app, &dialog, Some("UNITREE"), 0.0), 2);
         let dom = app.workspaces[0].tiles.get_pane(&dom).unwrap();
         assert_eq!(dom.market, chosen);
         assert!(dom.unavailable_markets.is_empty());
@@ -641,7 +1078,7 @@ mod tests {
         app.workspaces[0] = Tree::new("batch-test", root, tiles);
         let before = serde_json::to_string(&app.workspaces).unwrap();
         let other = serde_json::to_string(&app.workspaces[1]).unwrap();
-        assert_eq!(apply(&mut app, &Dialog::new(0), "BTC", 0.0), 3);
+        assert_eq!(apply(&mut app, &Dialog::new(0), Some("BTC"), 0.0), 3);
         assert_eq!(
             app.workspaces[0]
                 .tiles
@@ -677,8 +1114,8 @@ mod tests {
         let undo = app.batch_undo.take().unwrap();
         restore(&mut app, undo);
         assert_eq!(serde_json::to_string(&app.workspaces).unwrap(), before);
-        apply(&mut app, &Dialog::new(0), "BTC", 0.0);
-        apply(&mut app, &Dialog::new(0), "PONS", 1.0);
+        apply(&mut app, &Dialog::new(0), Some("BTC"), 0.0);
+        apply(&mut app, &Dialog::new(0), Some("PONS"), 1.0);
         assert!(
             app.workspaces[0]
                 .tiles

@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 use crate::AppState;
 
 pub(crate) mod additional;
+pub(crate) mod coinbase;
 pub(crate) mod hyperliquid;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -235,7 +236,10 @@ fn parse_trades(exchange: Exchange, value: &Value) -> Vec<Trade> {
                             _ => TradeSide::Unknown,
                         }
                     }
-                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+                    Exchange::Kucoin
+                    | Exchange::Kraken
+                    | Exchange::Pacifica
+                    | Exchange::Coinbase => unreachable!(),
                 },
             })
         })
@@ -875,6 +879,9 @@ fn public_heartbeat(exchange: Exchange, time_ms: i64) -> Message {
 }
 
 async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
+    if market.exchange == Exchange::Coinbase {
+        return coinbase::stream(market, state).await;
+    }
     if additional::handles(market.exchange) {
         return additional::stream(market, state).await;
     }
@@ -927,7 +934,9 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
         Exchange::Lighter => "wss://mainnet.zklighter.elliot.ai/stream".to_owned(),
         Exchange::Bitget => "wss://ws.bitget.com/v2/ws/public".to_owned(),
         Exchange::Bitunix => "wss://fapi.bitunix.com/public/".to_owned(),
-        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica | Exchange::Coinbase => {
+            unreachable!()
+        }
     };
     let mut request = url.into_client_request()?;
     if market.exchange == Exchange::Gate && market.kind == MarketKind::Perp {
@@ -1013,7 +1022,9 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
             {"symbol":symbol,"ch":"depth_books"},
             {"symbol":symbol,"ch":"trade"}
         ]})],
-        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica | Exchange::Coinbase => {
+            unreachable!()
+        }
     };
     for subscription in subscriptions {
         socket
@@ -1134,7 +1145,10 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                         integer(&value["data"][0]["ts"]).or_else(|| integer(&value["ts"]))
                     }
                     Exchange::Bitunix => integer(&value["ts"]),
-                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+                    Exchange::Kucoin
+                    | Exchange::Kraken
+                    | Exchange::Pacifica
+                    | Exchange::Coinbase => unreachable!(),
                 }
                 .unwrap_or_else(now_ms);
                 let mut delta_rows: Option<(&Value, &Value)> = None;
@@ -1258,7 +1272,10 @@ async fn stream_books(market: &Market, state: &AppState) -> Result<(), Error> {
                             false
                         }
                     }
-                    Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+                    Exchange::Kucoin
+                    | Exchange::Kraken
+                    | Exchange::Pacifica
+                    | Exchange::Coinbase => unreachable!(),
                 };
                 if ready {
                     if book.is_crossed() {
@@ -1350,6 +1367,9 @@ async fn fetch_candles(
     client: &crate::http::Client,
     count: usize,
 ) -> Result<Vec<Candle>, Error> {
+    if market.exchange == Exchange::Coinbase {
+        return coinbase::candles(market, client, count).await;
+    }
     if additional::handles(market.exchange) {
         return additional::candles(market, state, count).await;
     }
@@ -1538,7 +1558,9 @@ async fn fetch_candles(
                 .json()
                 .await?
         }
-        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica | Exchange::Coinbase => {
+            unreachable!()
+        }
     };
     let rows = match market.exchange {
         Exchange::Binance | Exchange::Aster | Exchange::Hyperliquid => &value,
@@ -1547,7 +1569,9 @@ async fn fetch_candles(
         Exchange::Gate => &value,
         Exchange::Lighter => &value["c"],
         Exchange::Bitget | Exchange::Bitunix => &value["data"],
-        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica => unreachable!(),
+        Exchange::Kucoin | Exchange::Kraken | Exchange::Pacifica | Exchange::Coinbase => {
+            unreachable!()
+        }
     };
     let mut candles = rows
         .as_array()

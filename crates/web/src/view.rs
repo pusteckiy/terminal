@@ -47,6 +47,7 @@ pub(super) fn venue_code(exchange: Exchange) -> &'static str {
         Exchange::Kucoin => "KUC",
         Exchange::Kraken => "KRK",
         Exchange::Pacifica => "PAC",
+        Exchange::Coinbase => "COIN",
     }
 }
 
@@ -1288,6 +1289,7 @@ pub(super) fn venue_color(exchange: Exchange) -> Color32 {
         Exchange::Kucoin => Color32::from_rgb(67, 174, 145),
         Exchange::Kraken => Color32::from_rgb(137, 126, 226),
         Exchange::Pacifica => Color32::from_rgb(143, 177, 255),
+        Exchange::Coinbase => Color32::from_rgb(93, 139, 255),
     }
 }
 

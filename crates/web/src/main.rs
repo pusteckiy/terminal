@@ -536,14 +536,20 @@ impl MarketData {
     }
 
     fn set_book(&mut self, mut book: Book, exchange: Exchange, observe_events: bool) {
-        if self
-            .book
-            .as_ref()
-            .is_some_and(|previous| book.updated_at_ms < previous.updated_at_ms)
+        let baseline = exchange == Exchange::Coinbase && book.updated_at_ms == 0;
+        if !baseline
+            && self
+                .book
+                .as_ref()
+                .is_some_and(|previous| book.updated_at_ms < previous.updated_at_ms)
         {
             return;
         }
+        if baseline {
+            self.best_bid_ask = None;
+        }
         if observe_events
+            && !baseline
             && self.connected
             && let Some(previous) = &self.book
         {
@@ -569,10 +575,12 @@ impl MarketData {
                 }
             }
         }
-        if !matches!(
-            exchange,
-            Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter | Exchange::Pacifica
-        ) && let (Some(bid), Some(ask)) = (book.bids.first(), book.asks.first())
+        if !baseline
+            && !matches!(
+                exchange,
+                Exchange::Gate | Exchange::Hyperliquid | Exchange::Lighter | Exchange::Pacifica
+            )
+            && let (Some(bid), Some(ask)) = (book.bids.first(), book.asks.first())
             && self
                 .best_bid_ask
                 .as_ref()
@@ -1319,7 +1327,7 @@ impl TerminalApp {
                                     .color(MUTED),
                             );
                             ui.separator();
-                            if ui.button("Change symbol…").clicked() {
+                            if ui.button("Change markets…").clicked() {
                                 change_symbol = Some(index);
                                 ui.close();
                             }
@@ -1804,7 +1812,11 @@ fn sources_list(ui: &mut egui::Ui, pane: &mut Pane) {
         let exchange = Exchange::ALL
             .into_iter()
             .find(|exchange| {
-                !pane.series.iter().any(|m| {
+                exchange.supports(
+                    pane.series
+                        .get(pane.editing_series)
+                        .map_or(MarketKind::Spot, |m| m.kind),
+                ) && !pane.series.iter().any(|m| {
                     m.exchange == *exchange
                         && m.kind
                             == pane
@@ -1862,7 +1874,14 @@ fn market_editor(
             .clicked()
             && market.exchange != exchange
         {
-            *market = Market::for_exchange_kind(exchange, market.kind);
+            *market = Market::for_exchange_kind(
+                exchange,
+                if exchange.supports(market.kind) {
+                    market.kind
+                } else {
+                    MarketKind::Spot
+                },
+            );
             search.clear();
         }
     }
@@ -1871,7 +1890,10 @@ fn market_editor(
     ui.horizontal(|ui| {
         for kind in MarketKind::ALL {
             if ui
-                .selectable_label(market.kind == kind, kind.label())
+                .add_enabled_ui(market.exchange.supports(kind), |ui| {
+                    ui.selectable_label(market.kind == kind, kind.label())
+                })
+                .inner
                 .clicked()
                 && market.kind != kind
             {
@@ -2876,6 +2898,61 @@ mod tests {
         assert_eq!(old.imbalance.weighting, imbalance::Weighting::Flat);
         assert_eq!(old.imbalance.half_life_bps, 2.0);
         assert_eq!(old.events.types, [true; 4]);
+    }
+
+    #[test]
+    fn coinbase_reconnect_baselines_replace_old_books_without_synthetic_events() {
+        let level = |price: &str| Level {
+            price: price.into(),
+            size: "1".into(),
+            quote_size: String::new(),
+            depth_base: String::new(),
+            depth_quote: String::new(),
+        };
+        let mut data = MarketData {
+            connected: true,
+            ..Default::default()
+        };
+        data.events.set_enabled(true);
+        data.set_book(
+            Book {
+                bids: vec![level("100")],
+                asks: vec![level("101")],
+                updated_at_ms: 1000,
+            },
+            Exchange::Coinbase,
+            false,
+        );
+        data.set_book(
+            Book {
+                bids: vec![level("102")],
+                asks: vec![level("103")],
+                updated_at_ms: 0,
+            },
+            Exchange::Coinbase,
+            true,
+        );
+        assert_eq!(data.book.as_ref().unwrap().bids[0].price, "102");
+        assert!(
+            data.best_bid_ask.is_none(),
+            "wait for a timestamped update before recording quotes"
+        );
+        assert!(
+            data.events.records.is_empty(),
+            "reconnect snapshots establish a fresh baseline"
+        );
+        data.apply_book_delta(
+            vec![BookChange {
+                price: "102".into(),
+                size: "2".into(),
+            }],
+            vec![],
+            1001,
+            Exchange::Coinbase,
+        );
+        assert_eq!(data.book.as_ref().unwrap().bids[0].size, "2");
+        assert_eq!(data.best_bid_ask.as_ref().unwrap().bid, "102");
+        assert_eq!(data.events.records.len(), 1);
     }
 
     #[test]
