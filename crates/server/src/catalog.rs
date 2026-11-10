@@ -255,7 +255,11 @@ fn parse(exchange: Exchange, kind: MarketKind, response: &Value) -> Result<Vec<S
             let (enabled, symbol, base, quote, market_id, size_multiplier) = match exchange {
                 Exchange::Binance => (
                     row["status"] == "TRADING"
-                        && (kind == MarketKind::Spot || row["contractType"] == "PERPETUAL"),
+                        && (kind == MarketKind::Spot
+                            || matches!(
+                                row["contractType"].as_str(),
+                                Some("PERPETUAL" | "TRADIFI_PERPETUAL")
+                            )),
                     row["symbol"].as_str()?,
                     row["baseAsset"].as_str()?,
                     row["quoteAsset"].as_str()?,
@@ -535,6 +539,27 @@ mod tests {
         let spot = parse(Exchange::Lighter, MarketKind::Spot, &lighter).unwrap();
         assert_eq!(perps[0].market_id, Some(1));
         assert_eq!(spot[0].quote, "USDC");
+    }
+
+    #[test]
+    fn binance_perp_catalog_includes_tradfi_but_excludes_inactive_and_dated_contracts() {
+        let value = json!({"symbols":[
+            {"symbol":"BTCUSDT","status":"TRADING","contractType":"PERPETUAL","baseAsset":"BTC","quoteAsset":"USDT"},
+            {"symbol":"NVDAUSDT","status":"TRADING","contractType":"TRADIFI_PERPETUAL","baseAsset":"NVDA","quoteAsset":"USDT","underlyingType":"EQUITY"},
+            {"symbol":"OLDUSDT","status":"BREAK","contractType":"TRADIFI_PERPETUAL","baseAsset":"OLD","quoteAsset":"USDT"},
+            {"symbol":"BTCUSDT_261225","status":"TRADING","contractType":"CURRENT_QUARTER","baseAsset":"BTC","quoteAsset":"USDT"},
+            {"symbol":"UNKNOWNUSDT","status":"TRADING","contractType":"UNKNOWN","baseAsset":"UNKNOWN","quoteAsset":"USDT"}
+        ]});
+        let symbols = parse(Exchange::Binance, MarketKind::Perp, &value).unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|info| info.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTCUSDT", "NVDAUSDT"]
+        );
+        assert_eq!(symbols[1].base, "NVDA");
+        assert_eq!(symbols[1].quote, "USDT");
     }
 
     #[test]
