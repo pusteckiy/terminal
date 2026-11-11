@@ -56,6 +56,33 @@ fn parse_orders(data: &Value) -> Option<Vec<OwnOrder>> {
     )
 }
 
+fn apply_order_snapshot(data: &Value, current: &mut AccountState) -> Option<()> {
+    let dex = data.get("dex").map_or(Some(""), Value::as_str)?;
+    let mut orders = parse_orders(data)?;
+    for order in &mut orders {
+        if !dex.is_empty() && !order.coin.contains(':') {
+            order.coin = format!("{dex}:{}", order.coin);
+        }
+    }
+    // Each feed is a complete snapshot of one DEX, not of the entire account.
+    current
+        .orders
+        .retain(|order| order.coin.split_once(':').map_or("", |(dex, _)| dex) != dex);
+    current.orders.extend(orders);
+    Some(())
+}
+
+fn new_order_dexs(data: &Value, subscribed: &mut HashSet<String>) -> Vec<String> {
+    data["clearinghouseStates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pair| pair[0].as_str())
+        .filter(|dex| subscribed.insert((*dex).to_owned()))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn parse_positions(data: &Value) -> Option<Vec<Position>> {
     let rows = data["clearinghouseState"]["assetPositions"].as_array()?;
     let mut positions = Vec::new();
@@ -172,15 +199,19 @@ fn fill_position(fill: &OwnFill) -> Option<LivePosition> {
     })
 }
 
-fn subscription(kind: &str, account: &Account, method: &str) -> Message {
+fn subscription(kind: &str, account: &Account, method: &str, dex: Option<&str>) -> Message {
+    let mut feed = if kind == "userFills" {
+        json!({"type": kind, "user": account.address, "aggregateByTime": false})
+    } else {
+        json!({"type": kind, "user": account.address})
+    };
+    if let Some(dex) = dex {
+        feed["dex"] = json!(dex);
+    }
     Message::Text(
         json!({
             "method": method,
-            "subscription": if kind == "userFills" {
-                json!({"type": kind, "user": account.address, "aggregateByTime": false})
-            } else {
-                json!({"type": kind, "user": account.address})
-            }
+            "subscription": feed
         })
         .to_string()
         .into(),
@@ -271,7 +302,8 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
             continue;
         };
         let mut subscribed = HashSet::<Account>::new();
-        let mut received = HashMap::<Account, (bool, bool)>::new();
+        let mut received = HashMap::<Account, (HashSet<String>, bool)>::new();
+        let mut order_dexs = HashMap::<Account, HashSet<String>>::new();
         let mut ping = tokio::time::interval(Duration::from_secs(25));
         'connected: loop {
             let desired: HashSet<_> = control
@@ -288,11 +320,27 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                     "spotState",
                 ] {
                     if socket
-                        .send(subscription(kind, account, "unsubscribe"))
+                        .send(subscription(kind, account, "unsubscribe", None))
                         .await
                         .is_err()
                     {
                         break 'connected;
+                    }
+                }
+                if let Some(dexs) = order_dexs.remove(account) {
+                    for dex in dexs.into_iter().filter(|dex| !dex.is_empty()) {
+                        if socket
+                            .send(subscription(
+                                "openOrders",
+                                account,
+                                "unsubscribe",
+                                Some(&dex),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break 'connected;
+                        }
                     }
                 }
                 received.remove(account);
@@ -306,14 +354,15 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                     "spotState",
                 ] {
                     if socket
-                        .send(subscription(kind, account, "subscribe"))
+                        .send(subscription(kind, account, "subscribe", None))
                         .await
                         .is_err()
                     {
                         break 'connected;
                     }
                 }
-                received.insert(account.clone(), (false, false));
+                received.insert(account.clone(), (HashSet::new(), false));
+                order_dexs.insert(account.clone(), HashSet::from([String::new()]));
             }
             subscribed = desired;
             let excess = control
@@ -385,19 +434,25 @@ pub async fn run(state: AppState, mut control: watch::Receiver<Vec<Account>>) {
                     let Some(flags) = received.get_mut(account) else { continue; };
                     let mut current = state.accounts.read().await.get(account).cloned().unwrap_or_default();
                     if channel == "openOrders" {
-                        let Some(orders) = parse_orders(data) else { continue; };
-                        current.orders = orders;
-                        flags.0 = true;
+                        let Some(dex) = data.get("dex").map_or(Some(""), Value::as_str) else { continue; };
+                        if !order_dexs.get(account).is_some_and(|dexs| dexs.contains(dex)) { continue; }
+                        let Some(()) = apply_order_snapshot(data, &mut current) else { continue; };
+                        flags.0.insert(dex.to_owned());
                     } else if channel == "allDexsClearinghouseState" {
                         let Some(changed) = apply_position_snapshot(data, &mut current) else { continue; };
                         if changed { current.positions_updated_at_ms = now_ms(); }
+                        for dex in new_order_dexs(data, order_dexs.entry(account.clone()).or_default()) {
+                            if socket.send(subscription("openOrders", account, "subscribe", Some(&dex))).await.is_err() {
+                                break 'connected;
+                            }
+                        }
                         flags.1 = true;
                     } else {
                         let Some(balances) = parse_spot_balances(data) else { continue; };
                         current.spot_balances = balances;
                         current.spot_updated_at_ms = now_ms();
                     }
-                    current.connected = flags.0 && flags.1;
+                    current.connected = flags.1 && order_dexs.get(account).is_some_and(|dexs| dexs.is_subset(&flags.0));
                     current.updated_at_ms = now_ms();
                     current.error = None;
                     state.publish_account(account, current).await;
@@ -602,11 +657,82 @@ mod tests {
                 address: "0x1234".into(),
             },
             "subscribe",
+            None,
         ) else {
             panic!()
         };
         let value: Value = serde_json::from_str(&subscription).unwrap();
         assert_eq!(value["subscription"]["aggregateByTime"], false);
+    }
+
+    #[test]
+    fn builder_order_feeds_are_discovered_once_and_keep_dex_on_unsubscribe() {
+        let mut subscribed = HashSet::from([String::new()]);
+        let states = json!({"clearinghouseStates":[["",{}],["io",{}],["xyz",{}]]});
+        assert_eq!(new_order_dexs(&states, &mut subscribed), ["io", "xyz"]);
+        assert!(new_order_dexs(&states, &mut subscribed).is_empty());
+        let added = json!({"clearinghouseStates":[["",{}],["io",{}],["xyz",{}],["new",{}]]});
+        assert_eq!(new_order_dexs(&added, &mut subscribed), ["new"]);
+        let account = Account {
+            exchange: Exchange::Hyperliquid,
+            address: "0x1234".into(),
+        };
+        for method in ["subscribe", "unsubscribe"] {
+            let Message::Text(text) = subscription("openOrders", &account, method, Some("io"))
+            else {
+                panic!()
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["method"], method);
+            assert_eq!(
+                value["subscription"],
+                json!({"type":"openOrders","user":account.address,"dex":"io"})
+            );
+        }
+    }
+
+    #[test]
+    fn order_snapshots_merge_dexes_and_clear_only_the_updated_dex() {
+        let snapshot = |dex: &str, coin: &str, oid: u64| {
+            json!({"dex":dex,"orders":[
+                {"coin":coin,"oid":oid,"side":"B","limitPx":"175.64","sz":"0.1"}
+            ]})
+        };
+        let mut current = AccountState::default();
+        apply_order_snapshot(&snapshot("", "CRV", 1), &mut current).unwrap();
+        apply_order_snapshot(&snapshot("io", "io:NVDA", 2), &mut current).unwrap();
+        apply_order_snapshot(&snapshot("xyz", "NVDA", 3), &mut current).unwrap();
+        assert_eq!(
+            current.orders.len(),
+            3,
+            "HIP-3 snapshots must retain native and other DEX orders"
+        );
+        assert!(
+            current
+                .orders
+                .iter()
+                .any(|order| order.matches_market(&Market {
+                    exchange: Exchange::Hyperliquid,
+                    kind: MarketKind::Perp,
+                    symbol: "io:NVDA".into(),
+                }))
+        );
+        assert!(current.orders.iter().any(|order| order.coin == "xyz:NVDA"));
+        apply_order_snapshot(&snapshot("io", "io:NVDA", 4), &mut current).unwrap();
+        assert_eq!(current.orders.len(), 3);
+        assert!(!current.orders.iter().any(|order| order.order_id == 2));
+        let before = current.orders.clone();
+        assert!(apply_order_snapshot(&json!({"dex":"io"}), &mut current).is_none());
+        assert_eq!(
+            current.orders, before,
+            "malformed snapshots must not erase orders"
+        );
+        apply_order_snapshot(&json!({"dex":"io","orders":[]}), &mut current).unwrap();
+        assert_eq!(current.orders.len(), 2);
+        assert!(current.orders.iter().all(|order| order.coin != "io:NVDA"));
+        apply_order_snapshot(&json!({"dex":"","orders":[]}), &mut current).unwrap();
+        assert_eq!(current.orders.len(), 1);
+        assert_eq!(current.orders[0].coin, "xyz:NVDA");
     }
 
     #[test]
